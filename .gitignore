@@ -27,13 +27,11 @@ Desktop.ini
 *.mov
 *.avi
 
-# 忽略生成的封面图 (如果你不希望它进版本控制)
-track_cover.png
-
 # === 数据文件 ===
 # 建议忽略 CSV 文件，因为遥测数据通常很大且含有隐私
 # 如果你想提交示例数据，可以创建一个 'examples/' 文件夹并使用 
 !examples/*.csv
+!examples/*.png
 
 # === 打包发布 (如果未来使用 PyInstaller) ===
 build/
