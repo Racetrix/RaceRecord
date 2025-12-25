@@ -1,0 +1,44 @@
+# === Python 基础 ===
+__pycache__/
+output/
+*.py[cod]
+*$py.class
+
+# === 虚拟环境 ===
+# 匹配常见的虚拟环境文件夹名
+venv/
+.venv/
+env/
+ENV/
+
+# === IDE 设置 (可选) ===
+.vscode/
+.idea/
+*.swp
+
+# === 操作系统生成文件 ===
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# === 项目输出文件 (生成的视频和图片) ===
+# 忽略所有生成的视频
+*.mp4
+*.mov
+*.avi
+
+# 忽略生成的封面图 (如果你不希望它进版本控制)
+track_cover.png
+
+# === 数据文件 ===
+# 建议忽略 CSV 文件，因为遥测数据通常很大且含有隐私
+# 如果你想提交示例数据，可以创建一个 'examples/' 文件夹并使用 
+!examples/*.csv
+
+# === 打包发布 (如果未来使用 PyInstaller) ===
+build/
+dist/
+*.spec
+
+# === 其它日志 ===
+*.log
