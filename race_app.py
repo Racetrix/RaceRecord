@@ -1,23 +1,28 @@
 import sys
 import os
+import math
 import numpy as np
 import imageio
+# 确保安装了 imageio-ffmpeg: pip install imageio-ffmpeg
+
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QFileDialog, QComboBox, QGroupBox, 
     QFrame, QMessageBox, QProgressBar, QRadioButton, QButtonGroup, 
     QStackedWidget, QCheckBox, QSlider, QScrollArea, QSizePolicy
 )
-from PyQt6.QtGui import QPainter, QImage
-from PyQt6.QtCore import Qt, QTimer, QThread, pyqtSignal
+from PyQt6.QtGui import QPainter, QImage, QColor, QFont, QPen, QLinearGradient, QBrush, QPainterPath
+from PyQt6.QtCore import Qt, QTimer, QThread, pyqtSignal, QPointF, QRectF
 
 from race_data import DataManager
 from race_render import Renderer, qimage_to_numpy, MODE_PATH, MODE_GAUGE, STYLE_DIGITAL, STYLE_NEEDLE, MAP_STATIC_NORTH, MAP_DYNAMIC_HEAD, COLOR_SPEED, COLOR_WHITE, COLOR_RED, COLOR_CYAN, RESOLUTION
+from race_intro import IntroRenderer, INTRO_NAMES, INTRO_CLASSIC
 
 STYLESHEET = """
 QMainWindow { background-color: #181818; }
 QWidget { font-family: 'Segoe UI', sans-serif; font-size: 14px; color: #E0E0E0; }
 QLabel#title { font-size: 20px; font-weight: bold; color: #4EC9B0; letter-spacing: 1px; margin-bottom: 10px; }
+QLabel#help_text { font-size: 11px; color: #888; font-style: italic; margin-bottom: 5px; }
 QGroupBox { border: 1px solid #333; border-radius: 6px; margin-top: 15px; padding-top: 15px; padding-bottom: 5px; background-color: #202020; font-weight: bold; color: #888; }
 QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 5px; color: #4EC9B0; top: 0px; }
 QPushButton { background-color: #2D2D2D; border: 1px solid #3E3E3E; border-radius: 4px; padding: 6px 12px; color: #EEE; font-weight: bold; }
@@ -44,110 +49,171 @@ QScrollArea { border: none; background: transparent; }
 """
 
 class RecorderWorker(QThread):
-    progress = pyqtSignal(int); finished = pyqtSignal(str)
-    def __init__(self, renderer, output_path, transparent, render_mode, fps):
+    progress = pyqtSignal(int)
+    finished = pyqtSignal(str)
+    error_occurred = pyqtSignal(str)
+    
+    def __init__(self, renderer, intro_renderer, output_path, transparent, render_mode, fps, show_intro, intro_style, logo_size):
         super().__init__()
-        self.renderer = renderer; self.path = output_path
-        self.transparent = transparent; self.render_mode = render_mode
-        self.fps = fps; self.is_running = True
+        self.renderer = renderer
+        self.intro_renderer = intro_renderer
+        self.path = output_path
+        self.transparent = transparent
+        self.render_mode = render_mode
+        self.fps = fps
+        self.show_intro = show_intro
+        self.intro_style = intro_style
+        self.logo_size = logo_size
+        self.is_running = True
+
     def run(self):
-        w, h = RESOLUTION
-        if w%2!=0: w-=1; 
-        if h%2!=0: h-=1
-        duration = self.renderer.dm.total_duration
-        total_frames = int(duration * self.fps)
-        dt = 1.0/self.fps; current_t = 0.0
-        
-        if self.transparent: 
-            writer = imageio.get_writer(self.path, fps=self.fps, codec='png', pixelformat='rgba', format='FFMPEG', macro_block_size=1)
-        else: 
-            writer = imageio.get_writer(self.path, fps=self.fps, codec='libx264', pixelformat='yuv420p', quality=8, macro_block_size=1)
-        
-        image = QImage(w, h, QImage.Format.Format_ARGB32_Premultiplied)
         try:
+            w, h = RESOLUTION
+            # 🔥 修复：分开写，符合 Python 语法
+            if w % 2 != 0: w -= 1
+            if h % 2 != 0: h -= 1
+            
+            data_duration = self.renderer.dm.total_duration
+            if data_duration <= 0: raise ValueError("没有有效数据")
+
+            # 计算帧数
+            data_frames = int(data_duration * self.fps)
+            intro_duration = self.intro_renderer.duration if self.show_intro else 0
+            intro_frames = int(intro_duration * self.fps)
+            total_frames = intro_frames + data_frames
+            
+            if self.transparent: 
+                writer = imageio.get_writer(self.path, fps=self.fps, codec='png', pixelformat='rgba', format='FFMPEG', macro_block_size=1)
+            else: 
+                writer = imageio.get_writer(self.path, fps=self.fps, codec='libx264', pixelformat='yuv420p', bitrate='12000k', macro_block_size=1)
+            
+            image = QImage(w, h, QImage.Format.Format_ARGB32_Premultiplied)
+            dt = 1.0/self.fps
+            
+            # --- 循环渲染所有帧 ---
             for i in range(total_frames):
                 if not self.is_running: break
+                
+                # 1. 计算当前时间点 (相对总时间)
+                current_total_time = i * dt
+                
+                # 2. 清空画布
+                image.fill(Qt.GlobalColor.transparent if self.transparent else Qt.GlobalColor.black)
                 painter = QPainter(image)
+                
                 try:
-                    self.renderer.render(painter, w, h, current_t, self.transparent, self.render_mode)
+                    # 3. 判断是画片头还是画数据
+                    if self.show_intro and current_total_time < intro_duration:
+                        # >>> 画片头 <<<
+                        self.intro_renderer.render(painter, w, h, current_total_time, self.intro_style, self.logo_size)
+                    else:
+                        # >>> 画赛道 <<<
+                        # 数据时间 = 总时间 - 片头时长
+                        data_time = current_total_time - intro_duration
+                        self.renderer.render(painter, w, h, data_time, self.transparent, self.render_mode)
                 finally:
                     painter.end()
+                
+                # 4. 写入
                 rgba = qimage_to_numpy(image)
                 if self.transparent: writer.append_data(rgba)
                 else: writer.append_data(rgba[:,:,:3])
-                current_t += dt
-                if i%10==0: self.progress.emit(int((i/total_frames)*100))
-        except Exception as e: print(f"Rec Error: {e}")
-        finally: writer.close(); self.finished.emit(self.path)
+                
+                # 5. 进度
+                if i % 10 == 0: 
+                    prog = int((i / total_frames) * 100)
+                    self.progress.emit(prog)
+
+            writer.close()
+            self.finished.emit(self.path)
+
+        except Exception as e:
+            self.error_occurred.emit(str(e))
+
     def stop(self): self.is_running = False
 
 class RaceCanvas(QWidget):
-    def __init__(self, renderer):
+    def __init__(self, renderer, intro_renderer):
         super().__init__()
-        self.renderer = renderer; self.current_time = 0.0; self.render_mode = MODE_PATH
+        self.renderer = renderer
+        self.intro_renderer = intro_renderer
+        self.current_app_time = 0.0 # 这是包含片头的总时间
+        self.render_mode = MODE_PATH
+        
+        # 预览状态配置
+        self.preview_show_intro = True
+        self.preview_intro_style = INTRO_CLASSIC
+        self.preview_logo_size = 140
+
     def set_mode(self, mode): self.render_mode = mode; self.update()
+    
     def paintEvent(self, event):
         painter = QPainter(self)
-        self.renderer.render(painter, self.width(), self.height(), self.current_time, False, self.render_mode)
+        w, h = self.width(), self.height()
+        painter.fillRect(0, 0, w, h, Qt.GlobalColor.black) # 预览始终黑底
+        
+        intro_dur = self.intro_renderer.duration if self.preview_show_intro else 0
+        
+        if self.preview_show_intro and self.current_app_time < intro_dur:
+            # 渲染片头
+            self.intro_renderer.render(painter, w, h, self.current_app_time, self.preview_intro_style, self.preview_logo_size)
+        else:
+            # 渲染数据
+            data_time = self.current_app_time - intro_dur
+            # 边界检查
+            if data_time > self.renderer.dm.total_duration: data_time = self.renderer.dm.total_duration
+            # 渲染赛道
+            self.renderer.render(painter, w, h, data_time, False, self.render_mode)
 
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("RaceRecord v41.0 - 封面生成版")
+        self.setWindowTitle("Racetrix v43.1 - 稳定修复版")
         self.resize(1350, 900)
         self.setStyleSheet(STYLESHEET)
         
         self.data_manager = DataManager()
         self.renderer = Renderer(self.data_manager)
+        self.intro_renderer = IntroRenderer()
+        
         self.target_hz = 5.0
         self.smooth_window = 5
         self.recorder = None
+        self.logo_size_state = {'val': 140}
+        
         self.playback_timer = QTimer(); self.playback_timer.timeout.connect(self.update_playback)
         self.init_ui()
 
     def add_stepper(self, layout, label_text, min_val, max_val, current_val, step, callback, is_float=False):
         row = QHBoxLayout()
         row.setContentsMargins(0,0,0,0)
-        
         lbl_title = QLabel(label_text)
         lbl_val = QLabel(f"{current_val}")
         lbl_val.setFixedWidth(50)
         lbl_val.setAlignment(Qt.AlignmentFlag.AlignCenter)
         lbl_val.setStyleSheet("color: #4EC9B0; font-weight: bold; background: #222; border-radius: 3px;")
-        
-        btn_minus = QPushButton("-")
-        btn_minus.setProperty("class", "step_btn")
-        btn_plus = QPushButton("+")
-        btn_plus.setProperty("class", "step_btn")
-        
+        btn_minus = QPushButton("-"); btn_minus.setProperty("class", "step_btn")
+        btn_plus = QPushButton("+"); btn_plus.setProperty("class", "step_btn")
         state = {'val': current_val}
-
         def update_display():
             txt = f"{state['val']:.1f}" if is_float else f"{state['val']}"
             lbl_val.setText(txt)
-            callback(state['val'])
-
+            if callback: callback(state['val'])
         def change(delta):
             new_v = state['val'] + delta
             if new_v < min_val: new_v = min_val
             if new_v > max_val: new_v = max_val
             state['val'] = new_v
             update_display()
-
         btn_minus.clicked.connect(lambda: change(-step))
         btn_plus.clicked.connect(lambda: change(step))
-        
-        row.addWidget(lbl_title)
-        row.addStretch()
-        row.addWidget(btn_minus)
-        row.addWidget(lbl_val)
-        row.addWidget(btn_plus)
+        row.addWidget(lbl_title); row.addStretch(); row.addWidget(btn_minus); row.addWidget(lbl_val); row.addWidget(btn_plus)
         layout.addLayout(row)
         return state 
 
     def init_ui(self):
         main_widget = QWidget(); layout = QHBoxLayout(); layout.setContentsMargins(0,0,0,0)
-        self.canvas = RaceCanvas(self.renderer)
+        self.canvas = RaceCanvas(self.renderer, self.intro_renderer)
         
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
@@ -184,26 +250,20 @@ class MainWindow(QMainWindow):
 
         self.stack_settings = QStackedWidget()
         
-        # === Panel 1: 路径设置 ===
+        # Panel 1
         p1 = QWidget(); l1 = QVBoxLayout(); l1.setContentsMargins(0,0,0,0); l1.setSpacing(10)
         gb1 = QGroupBox("路径参数")
-        gl1 = QVBoxLayout()
-        gl1.setAlignment(Qt.AlignmentFlag.AlignTop)
-        
+        gl1 = QVBoxLayout(); gl1.setAlignment(Qt.AlignmentFlag.AlignTop)
         self.combo_map_style = QComboBox()
         self.combo_map_style.addItem("🌐 静态 (北向)", MAP_STATIC_NORTH)
         self.combo_map_style.addItem("🦅 动态 (车头向)", MAP_DYNAMIC_HEAD)
-        # 🔥 已移除: 道路预瞄选项
         self.combo_map_style.currentIndexChanged.connect(self.update_settings)
         gl1.addWidget(QLabel("地图视角:"))
         gl1.addWidget(self.combo_map_style)
-        
-        # 🔥 新增：呼吸缩放开关 (保留这个好功能)
         self.chk_zoom = QCheckBox("动感呼吸缩放 (Breathing Zoom)")
         self.chk_zoom.setChecked(True)
         self.chk_zoom.stateChanged.connect(lambda: setattr(self.renderer, 'enable_dynamic_zoom', self.chk_zoom.isChecked()) or self.canvas.update())
         gl1.addWidget(self.chk_zoom)
-        
         self.combo_path_color = QComboBox()
         self.combo_path_color.addItem("🌈 速度渐变", COLOR_SPEED)
         self.combo_path_color.addItem("⚪ 纯白", COLOR_WHITE)
@@ -212,20 +272,14 @@ class MainWindow(QMainWindow):
         self.combo_path_color.currentIndexChanged.connect(self.update_settings)
         gl1.addWidget(QLabel("轨迹配色:"))
         gl1.addWidget(self.combo_path_color)
-        
         self.add_stepper(gl1, "渐变起始 (Min)", 0, 300, 0, 10, lambda v: setattr(self.renderer, 'grad_min', v) or self.canvas.update())
         self.add_stepper(gl1, "渐变结束 (Max)", 10, 400, 160, 10, lambda v: setattr(self.renderer, 'grad_max', v) or self.canvas.update())
-        
         self.add_stepper(gl1, "路径粗细", 1, 50, 15, 1, lambda v: setattr(self.renderer, 'track_width', v) or self.canvas.update())
         self.add_stepper(gl1, "车标大小", 5, 100, 30, 2, lambda v: setattr(self.renderer, 'car_size', v) or self.canvas.update())
-        
-        gb1.setLayout(gl1); l1.addWidget(gb1)
-        l1.addStretch() 
-        p1.setLayout(l1); self.stack_settings.addWidget(p1)
+        gb1.setLayout(gl1); l1.addWidget(gb1); l1.addStretch(); p1.setLayout(l1); self.stack_settings.addWidget(p1)
 
-        # === Panel 2: 仪表设置 ===
+        # Panel 2
         p2 = QWidget(); l2 = QVBoxLayout(); l2.setContentsMargins(0,0,0,0); l2.setSpacing(10)
-        
         gb_layout = QGroupBox("布局调节")
         gl_layout = QVBoxLayout()
         self.add_stepper(gl_layout, "整体缩放", 0.2, 3.0, 1.0, 0.1, lambda v: setattr(self.renderer, 'gauge_scale', v) or self.canvas.update(), True)
@@ -233,31 +287,24 @@ class MainWindow(QMainWindow):
         self.add_stepper(gl_layout, "位置 Y", -900, 900, 0, 20, lambda v: setattr(self.renderer, 'gauge_offset_y', v) or self.canvas.update())
         self.add_stepper(gl_layout, "刻度粗细", 0.5, 5.0, 1.0, 0.5, lambda v: setattr(self.renderer, 'tick_width_scale', v) or self.canvas.update(), True)
         gb_layout.setLayout(gl_layout); l2.addWidget(gb_layout)
-
         gb2 = QGroupBox("显示参数")
         gl2 = QVBoxLayout()
         self.chk_show_gauge = QCheckBox("显示速度表"); self.chk_show_gauge.setChecked(True); self.chk_show_gauge.stateChanged.connect(self.update_settings)
         gl2.addWidget(self.chk_show_gauge)
-        
         self.combo_style = QComboBox(); self.combo_style.addItem("🔮 科技圆环", STYLE_DIGITAL); self.combo_style.addItem("🏎️ 物理指针", STYLE_NEEDLE)
         self.combo_style.currentIndexChanged.connect(self.update_settings)
         gl2.addWidget(self.combo_style)
-        
         self.add_stepper(gl2, "表底速度", 60, 400, 200, 20, lambda v: setattr(self.renderer, 'max_speed', v) or self.canvas.update())
-        
         self.chk_show_extra = QCheckBox("显示额外信息栏"); self.chk_show_extra.setChecked(False); self.chk_show_extra.stateChanged.connect(self.update_settings)
         gl2.addWidget(self.chk_show_extra)
-        
         sub_info = QHBoxLayout()
         self.chk_time = QCheckBox("时间"); self.chk_time.setChecked(True); self.chk_time.stateChanged.connect(self.update_settings)
         self.chk_sats = QCheckBox("卫星"); self.chk_sats.setChecked(True); self.chk_sats.stateChanged.connect(self.update_settings)
         self.chk_alt = QCheckBox("高度"); self.chk_alt.setChecked(False); self.chk_alt.stateChanged.connect(self.update_settings)
         sub_info.addWidget(self.chk_time); sub_info.addWidget(self.chk_sats); sub_info.addWidget(self.chk_alt)
         gl2.addLayout(sub_info)
+        gb2.setLayout(gl2); l2.addWidget(gb2); l2.addStretch(); p2.setLayout(l2); self.stack_settings.addWidget(p2)
         
-        gb2.setLayout(gl2); l2.addWidget(gb2)
-        l2.addStretch()
-        p2.setLayout(l2); self.stack_settings.addWidget(p2)
         ctrl_panel.addWidget(self.stack_settings)
 
         # 播放 & 录制
@@ -270,98 +317,44 @@ class MainWindow(QMainWindow):
         hl_play.addWidget(self.btn_play); hl_play.addWidget(self.slider)
         gb_ctrl.setLayout(hl_play); ctrl_panel.addWidget(gb_ctrl)
         
-        gb_export = QGroupBox("导出")
+        gb_export = QGroupBox("导出与片头")
         el = QVBoxLayout()
         hl_opt = QHBoxLayout()
         self.rb_trans = QRadioButton("透明"); self.rb_black = QRadioButton("黑底"); self.rb_trans.setChecked(True)
         bgg = QButtonGroup(self); bgg.addButton(self.rb_trans); bgg.addButton(self.rb_black)
-        
         self.combo_fps = QComboBox(); self.combo_fps.addItems(["30 FPS", "60 FPS"]); self.combo_fps.setCurrentIndex(1)
         hl_opt.addWidget(self.rb_trans); hl_opt.addWidget(self.rb_black); hl_opt.addStretch(); hl_opt.addWidget(self.combo_fps)
+        el.addLayout(hl_opt)
         
-        # 🔥 新增：生成封面图按钮
-        self.btn_snap = QPushButton("📸 生成路径封面图")
-        self.btn_snap.setObjectName("btn_snap")
-        self.btn_snap.clicked.connect(self.generate_cover_image)
+        # Intro 设置
+        self.chk_show_intro = QCheckBox("显示 Racetrix 片头 (Intro)")
+        self.chk_show_intro.setChecked(True)
+        self.chk_show_intro.stateChanged.connect(self.update_settings)
+        el.addWidget(self.chk_show_intro)
+        
+        hl_intro = QHBoxLayout()
+        self.combo_intro_style = QComboBox()
+        for k, v in INTRO_NAMES.items(): self.combo_intro_style.addItem(v, k)
+        self.combo_intro_style.currentIndexChanged.connect(self.update_settings)
+        hl_intro.addWidget(QLabel("样式:"))
+        hl_intro.addWidget(self.combo_intro_style)
+        el.addLayout(hl_intro)
+        
+        self.logo_size_state = self.add_stepper(el, "Logo 字号", 50, 300, 140, 10, lambda v: self.update_settings())
+        
+        el.addWidget(QLabel("💡 保持开启可帮助 Racetrix 提升知名度，感谢支持！", objectName="help_text"))
+        
+        self.btn_snap = QPushButton("📸 生成路径封面图"); self.btn_snap.setObjectName("btn_snap"); self.btn_snap.clicked.connect(self.generate_cover_image)
         el.addWidget(self.btn_snap)
-
-        self.btn_record = QPushButton("⏺ 开始渲染视频"); self.btn_record.setObjectName("btn_record")
-        self.btn_record.clicked.connect(self.toggle_record)
+        self.btn_record = QPushButton("⏺ 开始渲染视频"); self.btn_record.setObjectName("btn_record"); self.btn_record.clicked.connect(self.toggle_record)
         self.progress = QProgressBar(); self.progress.setValue(0)
-        
-        el.addLayout(hl_opt); el.addWidget(self.btn_record); el.addWidget(self.progress)
+        el.addWidget(self.btn_record); el.addWidget(self.progress)
         gb_export.setLayout(el); ctrl_panel.addWidget(gb_export)
 
         ctrl_panel.addStretch()
         scroll.setWidget(ctrl_content)
-        
         layout.addWidget(self.canvas, 1); layout.addWidget(scroll)
         main_widget.setLayout(layout); self.setCentralWidget(main_widget)
-
-    # 🔥🔥🔥 核心：生成封面图的逻辑 🔥🔥🔥
-    def generate_cover_image(self):
-        if self.data_manager.total_duration == 0:
-             QMessageBox.warning(self, "警告", "请先加载 CSV 数据文件")
-             return
-
-        path, _ = QFileDialog.getSaveFileName(self, "保存封面图", "track_cover.png", "PNG Image (*.png)")
-        if not path: return
-
-        # 1. 记住当前设置
-        old_style = self.renderer.map_style
-        old_gauge = self.renderer.show_gauge
-        old_extra = self.renderer.show_extra
-
-        # 2. 强制切换到适合封面的模式 (静态全景，无UI)
-        self.renderer.map_style = MAP_STATIC_NORTH
-        self.renderer.show_gauge = False
-        self.renderer.show_extra = False
-
-        # 3. 创建画布并渲染第0帧
-        w, h = RESOLUTION
-        if w%2!=0: w-=1; 
-        if h%2!=0: h-=1
-        
-        image = QImage(w, h, QImage.Format.Format_ARGB32_Premultiplied)
-        image.fill(Qt.GlobalColor.transparent) # 确保背景透明
-        painter = QPainter(image)
-        try:
-            # 渲染 t=0 时刻，透明背景，仅路径模式
-            self.renderer.render(painter, w, h, 0.0, True, MODE_PATH)
-        finally:
-            painter.end()
-
-        # 4. 保存
-        success = image.save(path)
-
-        # 5. 恢复之前的设置
-        self.renderer.map_style = old_style
-        self.renderer.show_gauge = old_gauge
-        self.renderer.show_extra = old_extra
-        # 同步UI状态
-        self.chk_show_gauge.setChecked(old_gauge)
-        self.chk_show_extra.setChecked(old_extra)
-
-        if success:
-            QMessageBox.information(self, "成功", f"封面图已成功保存至:\n{path}")
-        else:
-            QMessageBox.critical(self, "失败", "保存图像文件失败")
-
-    def set_hz(self, val):
-        self.target_hz = val
-        self.reprocess_data()
-    
-    def set_smooth(self, val):
-        self.smooth_window = int(val)
-        self.reprocess_data()
-
-    def reprocess_data(self):
-        self.data_manager.process(self.target_hz, self.smooth_window)
-        self.canvas.update()
-
-    def switch_mode(self, index):
-        self.canvas.set_mode(index)
-        self.stack_settings.setCurrentIndex(index)
 
     def update_settings(self):
         self.renderer.map_style = self.combo_map_style.currentData()
@@ -372,6 +365,19 @@ class MainWindow(QMainWindow):
         self.renderer.show_time = self.chk_time.isChecked()
         self.renderer.show_sats = self.chk_sats.isChecked()
         self.renderer.show_alt = self.chk_alt.isChecked()
+        
+        # 预览设置
+        self.canvas.preview_show_intro = self.chk_show_intro.isChecked()
+        self.canvas.preview_intro_style = self.combo_intro_style.currentData()
+        self.canvas.preview_logo_size = self.logo_size_state['val']
+        
+        # 刷新时间轴
+        intro_dur = self.intro_renderer.duration if self.canvas.preview_show_intro else 0
+        total_time = self.data_manager.total_duration + intro_dur
+        
+        if total_time > 0:
+            self.slider.setRange(0, int(total_time * 10))
+            
         self.canvas.update()
 
     def load_csv(self):
@@ -381,53 +387,106 @@ class MainWindow(QMainWindow):
             count, dur = self.data_manager.load_csv(path)
             self.lbl_info.setText(f"{os.path.basename(path)} | {dur:.1f}s")
             self.reprocess_data()
-            self.slider.setRange(0, int(dur*10))
-            self.canvas.update()
+            self.update_settings()
         except Exception as e: QMessageBox.critical(self, "Error", str(e))
+
+    def set_hz(self, val): self.target_hz = val; self.reprocess_data()
+    def set_smooth(self, val): self.smooth_window = int(val); self.reprocess_data()
+    def reprocess_data(self): 
+        self.data_manager.process(self.target_hz, self.smooth_window)
+        self.update_settings()
+
+    def switch_mode(self, index):
+        self.canvas.set_mode(index)
+        self.stack_settings.setCurrentIndex(index)
 
     def toggle_play(self):
         if self.playback_timer.isActive(): self.playback_timer.stop(); self.btn_play.setText("▶ 播放")
         else: self.playback_timer.start(16); self.btn_play.setText("⏸ 暂停")
 
     def update_playback(self):
-        self.canvas.current_time += 0.016
-        if self.canvas.current_time > self.data_manager.total_duration:
-            self.canvas.current_time = 0; self.playback_timer.stop(); self.btn_play.setText("▶ 播放")
-        self.slider.setValue(int(self.canvas.current_time*10)); self.canvas.update()
+        intro_dur = self.intro_renderer.duration if self.canvas.preview_show_intro else 0
+        total_time = self.data_manager.total_duration + intro_dur
+        
+        self.canvas.current_app_time += 0.016
+        
+        if self.canvas.current_app_time > total_time:
+            self.canvas.current_app_time = 0
+            self.playback_timer.stop()
+            self.btn_play.setText("▶ 播放")
+            
+        self.slider.setValue(int(self.canvas.current_app_time * 10))
+        self.canvas.update()
 
-    def seek(self, val): self.canvas.current_time = val/10.0; self.canvas.update()
+    def seek(self, val): 
+        self.canvas.current_app_time = val / 10.0
+        self.canvas.update()
+
+    def generate_cover_image(self):
+        if self.data_manager.total_duration == 0:
+             QMessageBox.warning(self, "警告", "请先加载 CSV 数据文件")
+             return
+        path, _ = QFileDialog.getSaveFileName(self, "保存封面图", "track_cover.png", "PNG Image (*.png)")
+        if not path: return
+        old_style = self.renderer.map_style
+        old_gauge = self.renderer.show_gauge
+        old_extra = self.renderer.show_extra
+        self.renderer.map_style = MAP_STATIC_NORTH
+        self.renderer.show_gauge = False
+        self.renderer.show_extra = False
+        w, h = RESOLUTION
+        # 🔥 修复：分开写
+        if w % 2 != 0: w -= 1
+        if h % 2 != 0: h -= 1
+        image = QImage(w, h, QImage.Format.Format_ARGB32_Premultiplied)
+        image.fill(Qt.GlobalColor.transparent) 
+        painter = QPainter(image)
+        try:
+            self.renderer.render(painter, w, h, 0.0, True, MODE_PATH)
+        finally:
+            painter.end()
+        image.save(path)
+        self.renderer.map_style = old_style
+        self.renderer.show_gauge = old_gauge
+        self.renderer.show_extra = old_extra
+        self.chk_show_gauge.setChecked(old_gauge)
+        self.chk_show_extra.setChecked(old_extra)
+        QMessageBox.information(self, "成功", f"封面图已保存")
 
     def toggle_record(self):
         if self.recorder and self.recorder.isRunning(): 
             self.recorder.stop()
-            self.btn_record.setText("⏺ 开始渲染视频")
-            self.btn_record.setObjectName("btn_record") 
-            self.btn_record.setStyle(self.btn_record.style())
+            self.btn_record.setText("⏺ 开始渲染视频"); self.btn_record.setObjectName("btn_record"); self.btn_record.setStyle(self.btn_record.style())
             return
-            
+        if self.data_manager.total_duration <= 0:
+            QMessageBox.warning(self, "无法开始", "请先加载 CSV 数据文件")
+            return
         is_transparent = self.rb_trans.isChecked()
         mode = self.combo_mode.currentIndex()
         fps = 60 if self.combo_fps.currentIndex() == 1 else 30
         ext = "mov" if is_transparent else "mp4"
         path, _ = QFileDialog.getSaveFileName(self, "Save", f"race_out.{ext}", f"Video (*.{ext})")
         if not path: return
-        
-        self.btn_record.setText("⏹ 停止渲染")
-        self.btn_record.setObjectName("btn_stop") 
-        self.btn_record.setStyle(self.btn_record.style())
-        
+        self.btn_record.setText("⏹ 停止渲染"); self.btn_record.setObjectName("btn_stop"); self.btn_record.setStyle(self.btn_record.style())
         self.progress.setValue(0); self.btn_load.setEnabled(False)
-        self.recorder = RecorderWorker(self.renderer, path, is_transparent, mode, fps)
+        show_intro = self.chk_show_intro.isChecked()
+        intro_style = self.combo_intro_style.currentData()
+        logo_size = self.logo_size_state['val']
+        self.recorder = RecorderWorker(self.renderer, self.intro_renderer, path, is_transparent, mode, fps, show_intro, intro_style, logo_size)
         self.recorder.progress.connect(self.progress.setValue)
         self.recorder.finished.connect(self.on_fin)
+        self.recorder.error_occurred.connect(self.on_error)
         self.recorder.start()
 
     def on_fin(self, path):
-        self.btn_record.setText("⏺ 开始渲染视频")
-        self.btn_record.setObjectName("btn_record")
-        self.btn_record.setStyle(self.btn_record.style())
+        self.btn_record.setText("⏺ 开始渲染视频"); self.btn_record.setObjectName("btn_record"); self.btn_record.setStyle(self.btn_record.style())
         self.btn_load.setEnabled(True); self.progress.setValue(100)
         QMessageBox.information(self, "完成", f"Saved:\n{path}")
+
+    def on_error(self, err_msg):
+        self.btn_record.setText("⏺ 开始渲染视频"); self.btn_record.setObjectName("btn_record"); self.btn_record.setStyle(self.btn_record.style())
+        self.btn_load.setEnabled(True)
+        QMessageBox.critical(self, "渲染错误", f"Error:\n{err_msg}")
 
 if __name__ == '__main__':
     os.environ["QT_AUTO_SCREEN_SCALE_FACTOR"] = "1"
