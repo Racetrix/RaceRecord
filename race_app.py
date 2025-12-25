@@ -17,6 +17,7 @@ from PyQt6.QtCore import Qt, QTimer, QThread, pyqtSignal, QPointF, QRectF
 from race_data import DataManager
 from race_render import Renderer, qimage_to_numpy, MODE_PATH, MODE_GAUGE, STYLE_DIGITAL, STYLE_NEEDLE, MAP_STATIC_NORTH, MAP_DYNAMIC_HEAD, COLOR_SPEED, COLOR_WHITE, COLOR_RED, COLOR_CYAN, RESOLUTION
 from race_intro import IntroRenderer, INTRO_NAMES, INTRO_CLASSIC
+from race_gauges import GAUGE_NAMES, STYLE_LINEAR
 
 STYLESHEET = """
 QMainWindow { background-color: #181818; }
@@ -69,14 +70,13 @@ class RecorderWorker(QThread):
     def run(self):
         try:
             w, h = RESOLUTION
-            # 🔥 修复：分开写，符合 Python 语法
+            # 修复：分行写
             if w % 2 != 0: w -= 1
             if h % 2 != 0: h -= 1
             
             data_duration = self.renderer.dm.total_duration
             if data_duration <= 0: raise ValueError("没有有效数据")
 
-            # 计算帧数
             data_frames = int(data_duration * self.fps)
             intro_duration = self.intro_renderer.duration if self.show_intro else 0
             intro_frames = int(intro_duration * self.fps)
@@ -90,36 +90,27 @@ class RecorderWorker(QThread):
             image = QImage(w, h, QImage.Format.Format_ARGB32_Premultiplied)
             dt = 1.0/self.fps
             
-            # --- 循环渲染所有帧 ---
             for i in range(total_frames):
                 if not self.is_running: break
                 
-                # 1. 计算当前时间点 (相对总时间)
                 current_total_time = i * dt
                 
-                # 2. 清空画布
                 image.fill(Qt.GlobalColor.transparent if self.transparent else Qt.GlobalColor.black)
                 painter = QPainter(image)
                 
                 try:
-                    # 3. 判断是画片头还是画数据
                     if self.show_intro and current_total_time < intro_duration:
-                        # >>> 画片头 <<<
                         self.intro_renderer.render(painter, w, h, current_total_time, self.intro_style, self.logo_size)
                     else:
-                        # >>> 画赛道 <<<
-                        # 数据时间 = 总时间 - 片头时长
                         data_time = current_total_time - intro_duration
                         self.renderer.render(painter, w, h, data_time, self.transparent, self.render_mode)
                 finally:
                     painter.end()
                 
-                # 4. 写入
                 rgba = qimage_to_numpy(image)
                 if self.transparent: writer.append_data(rgba)
                 else: writer.append_data(rgba[:,:,:3])
                 
-                # 5. 进度
                 if i % 10 == 0: 
                     prog = int((i / total_frames) * 100)
                     self.progress.emit(prog)
@@ -137,10 +128,8 @@ class RaceCanvas(QWidget):
         super().__init__()
         self.renderer = renderer
         self.intro_renderer = intro_renderer
-        self.current_app_time = 0.0 # 这是包含片头的总时间
+        self.current_app_time = 0.0 
         self.render_mode = MODE_PATH
-        
-        # 预览状态配置
         self.preview_show_intro = True
         self.preview_intro_style = INTRO_CLASSIC
         self.preview_logo_size = 140
@@ -150,25 +139,21 @@ class RaceCanvas(QWidget):
     def paintEvent(self, event):
         painter = QPainter(self)
         w, h = self.width(), self.height()
-        painter.fillRect(0, 0, w, h, Qt.GlobalColor.black) # 预览始终黑底
+        painter.fillRect(0, 0, w, h, Qt.GlobalColor.black) 
         
         intro_dur = self.intro_renderer.duration if self.preview_show_intro else 0
         
         if self.preview_show_intro and self.current_app_time < intro_dur:
-            # 渲染片头
             self.intro_renderer.render(painter, w, h, self.current_app_time, self.preview_intro_style, self.preview_logo_size)
         else:
-            # 渲染数据
             data_time = self.current_app_time - intro_dur
-            # 边界检查
             if data_time > self.renderer.dm.total_duration: data_time = self.renderer.dm.total_duration
-            # 渲染赛道
             self.renderer.render(painter, w, h, data_time, False, self.render_mode)
 
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Racetrix v43.1 - 稳定修复版")
+        self.setWindowTitle("Racetrix v43.2 - 语法终极修复版")
         self.resize(1350, 900)
         self.setStyleSheet(STYLESHEET)
         
@@ -291,9 +276,13 @@ class MainWindow(QMainWindow):
         gl2 = QVBoxLayout()
         self.chk_show_gauge = QCheckBox("显示速度表"); self.chk_show_gauge.setChecked(True); self.chk_show_gauge.stateChanged.connect(self.update_settings)
         gl2.addWidget(self.chk_show_gauge)
-        self.combo_style = QComboBox(); self.combo_style.addItem("🔮 科技圆环", STYLE_DIGITAL); self.combo_style.addItem("🏎️ 物理指针", STYLE_NEEDLE)
+        
+        self.combo_style = QComboBox()
+        for k, v in GAUGE_NAMES.items(): self.combo_style.addItem(v, k)
+        self.combo_style.setCurrentIndex(STYLE_LINEAR) 
         self.combo_style.currentIndexChanged.connect(self.update_settings)
         gl2.addWidget(self.combo_style)
+        
         self.add_stepper(gl2, "表底速度", 60, 400, 200, 20, lambda v: setattr(self.renderer, 'max_speed', v) or self.canvas.update())
         self.chk_show_extra = QCheckBox("显示额外信息栏"); self.chk_show_extra.setChecked(False); self.chk_show_extra.stateChanged.connect(self.update_settings)
         gl2.addWidget(self.chk_show_extra)
@@ -326,7 +315,6 @@ class MainWindow(QMainWindow):
         hl_opt.addWidget(self.rb_trans); hl_opt.addWidget(self.rb_black); hl_opt.addStretch(); hl_opt.addWidget(self.combo_fps)
         el.addLayout(hl_opt)
         
-        # Intro 设置
         self.chk_show_intro = QCheckBox("显示 Racetrix 片头 (Intro)")
         self.chk_show_intro.setChecked(True)
         self.chk_show_intro.stateChanged.connect(self.update_settings)
@@ -341,7 +329,6 @@ class MainWindow(QMainWindow):
         el.addLayout(hl_intro)
         
         self.logo_size_state = self.add_stepper(el, "Logo 字号", 50, 300, 140, 10, lambda v: self.update_settings())
-        
         el.addWidget(QLabel("💡 保持开启可帮助 Racetrix 提升知名度，感谢支持！", objectName="help_text"))
         
         self.btn_snap = QPushButton("📸 生成路径封面图"); self.btn_snap.setObjectName("btn_snap"); self.btn_snap.clicked.connect(self.generate_cover_image)
@@ -366,18 +353,13 @@ class MainWindow(QMainWindow):
         self.renderer.show_sats = self.chk_sats.isChecked()
         self.renderer.show_alt = self.chk_alt.isChecked()
         
-        # 预览设置
         self.canvas.preview_show_intro = self.chk_show_intro.isChecked()
         self.canvas.preview_intro_style = self.combo_intro_style.currentData()
         self.canvas.preview_logo_size = self.logo_size_state['val']
         
-        # 刷新时间轴
         intro_dur = self.intro_renderer.duration if self.canvas.preview_show_intro else 0
         total_time = self.data_manager.total_duration + intro_dur
-        
-        if total_time > 0:
-            self.slider.setRange(0, int(total_time * 10))
-            
+        if total_time > 0: self.slider.setRange(0, int(total_time * 10))
         self.canvas.update()
 
     def load_csv(self):
@@ -407,14 +389,11 @@ class MainWindow(QMainWindow):
     def update_playback(self):
         intro_dur = self.intro_renderer.duration if self.canvas.preview_show_intro else 0
         total_time = self.data_manager.total_duration + intro_dur
-        
         self.canvas.current_app_time += 0.016
-        
         if self.canvas.current_app_time > total_time:
             self.canvas.current_app_time = 0
             self.playback_timer.stop()
             self.btn_play.setText("▶ 播放")
-            
         self.slider.setValue(int(self.canvas.current_app_time * 10))
         self.canvas.update()
 
@@ -435,7 +414,7 @@ class MainWindow(QMainWindow):
         self.renderer.show_gauge = False
         self.renderer.show_extra = False
         w, h = RESOLUTION
-        # 🔥 修复：分开写
+        # 🔥 修复：分开写，符合 Python 语法
         if w % 2 != 0: w -= 1
         if h % 2 != 0: h -= 1
         image = QImage(w, h, QImage.Format.Format_ARGB32_Premultiplied)

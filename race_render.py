@@ -3,16 +3,17 @@ from PyQt6.QtGui import QPainter, QPen, QColor, QFont, QBrush, QPainterPath, QTr
 from PyQt6.QtCore import Qt, QPointF, QRectF
 import qtawesome as qta 
 
+# 🔥 引入新模块
+from race_gauges import DigitalGauge, NeedleGauge, LinearGauge, STYLE_DIGITAL, STYLE_NEEDLE, STYLE_LINEAR
+
 # ================= 常量定义 =================
 RESOLUTION = (1920, 1080)
 MODE_PATH = 0 
 MODE_GAUGE = 1
-STYLE_DIGITAL = 0 
-STYLE_NEEDLE = 1 
 
 # 地图视角
-MAP_STATIC_NORTH = 0  # 北向 (静态全局)
-MAP_DYNAMIC_HEAD = 1  # 车头向 (动态跟随)
+MAP_STATIC_NORTH = 0  # 北向
+MAP_DYNAMIC_HEAD = 1  # 车头向
 
 COLOR_SPEED = 0 
 COLOR_WHITE = 1  
@@ -43,7 +44,8 @@ class Renderer:
         self.track_width = 15     
         self.car_size = 30        
         self.map_style = MAP_STATIC_NORTH
-        self.gauge_style = STYLE_DIGITAL 
+        
+        self.gauge_style = STYLE_LINEAR # 默认用新样式
         self.max_speed = 200      
         self.show_gauge = True    
         self.show_extra = False    
@@ -51,7 +53,6 @@ class Renderer:
         self.show_sats = True
         self.show_alt = False     
         
-        # 布局参数
         self.gauge_scale = 1.0      
         self.gauge_offset_x = 0     
         self.gauge_offset_y = 0     
@@ -61,14 +62,16 @@ class Renderer:
         self.grad_min = 0.0
         self.grad_max = 160.0
         
-        # 动态缩放开关
         self.enable_dynamic_zoom = True
 
-        self.font_big = QFont("Arial", 90, QFont.Weight.Bold)
-        self.font_mid = QFont("Arial", 22, QFont.Weight.Bold)
+        # 🔥 初始化仪表实例
+        self.gauges = {
+            STYLE_DIGITAL: DigitalGauge(),
+            STYLE_NEEDLE: NeedleGauge(),
+            STYLE_LINEAR: LinearGauge()
+        }
+
         self.font_small = QFont("Consolas", 26, QFont.Weight.Bold)
-        self.font_ticks = QFont("Arial", 14, QFont.Weight.Bold)
-        self.font_needle_val = QFont("Arial", 55, QFont.Weight.Black) 
         
         try:
             self.icon_sat = qta.icon('fa5s.satellite', color='white').pixmap(64, 64)
@@ -145,7 +148,6 @@ class Renderer:
 
     def draw_dynamic_map(self, painter, w, h, s, current_time, transparent_bg):
         base_scale = 3.0 
-        
         if self.enable_dynamic_zoom:
             speed_ratio = np.clip(s['speed'] / 200.0, 0, 1) 
             zoom = base_scale * (1.8 - np.sqrt(speed_ratio) * 1.2)
@@ -153,7 +155,6 @@ class Renderer:
             speed_factor = max(0, s['speed']) / float(self.max_speed)
             zoom = base_scale * (1.0 - speed_factor * 0.6)
 
-        # 旋转逻辑 (回到简单的车头向)
         rotation_angle = -s['heading'] + 90
 
         transform = QTransform()
@@ -191,109 +192,21 @@ class Renderer:
             
         painter.resetTransform()
 
+    # 🔥🔥 修改：通过代理类绘制仪表 🔥🔥
     def draw_gauge_manual(self, painter, w, h, s, t):
-        base_cx = w / 2; base_cy = h / 2
-        target_cx = base_cx + self.gauge_offset_x
-        target_cy = base_cy + self.gauge_offset_y
-        
-        painter.save()
-        painter.translate(target_cx, target_cy)
-        painter.scale(self.gauge_scale, self.gauge_scale)
-        
-        if self.show_gauge:
-            if self.gauge_style == STYLE_DIGITAL: self.draw_digital_gauge(painter, 0, 0, s['speed'])
-            else: self.draw_needle_gauge(painter, 0, 0, s['speed'])
-        painter.restore()
+        if self.show_gauge and self.gauge_style in self.gauges:
+            # 1. 绘制速度表
+            base_cx = w / 2; base_cy = h / 2
+            target_cx = base_cx + self.gauge_offset_x
+            target_cy = base_cy + self.gauge_offset_y
+            
+            gauge_instance = self.gauges[self.gauge_style]
+            gauge_instance.render(painter, target_cx, target_cy, s['speed'], self.max_speed, self.gauge_scale, self.tick_width_scale)
 
         if self.show_extra:
             start_x = w - 350
             start_y = h - 300
             self.draw_extra_info(painter, start_x, start_y, t, s['sats'], s['alt'])
-
-    def draw_digital_gauge(self, painter, cx, cy, speed):
-        radius = 200
-        painter.setPen(QPen(QColor(40, 40, 40, 200), 25, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
-        painter.drawArc(QRectF(-radius, -radius, radius*2, radius*2), 225*16, -270*16)
-        
-        ratio = min(speed / self.max_speed, 1.0)
-        painter.setPen(QPen(get_speed_color(speed, 0, self.max_speed), 25, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
-        painter.drawArc(QRectF(-radius, -radius, radius*2, radius*2), 225*16, int(-270*ratio*16))
-        
-        painter.setFont(self.font_big); painter.setPen(Qt.GlobalColor.white)
-        painter.drawText(QRectF(-radius, -80, radius*2, 120), Qt.AlignmentFlag.AlignCenter, f"{int(speed)}")
-        painter.setFont(self.font_mid); painter.setPen(QColor(180, 180, 180))
-        painter.drawText(QRectF(-radius, 60, radius*2, 40), Qt.AlignmentFlag.AlignCenter, "KM/H")
-
-    def draw_needle_gauge(self, painter, cx, cy, speed):
-        radius = 200
-        painter.setFont(self.font_ticks)
-        max_val = int(self.max_speed)
-        
-        if max_val <= 60: main_step = 5
-        elif max_val <= 120: main_step = 10
-        elif max_val <= 260: main_step = 20
-        elif max_val <= 360: main_step = 30
-        else: main_step = 50
-            
-        if main_step == 30: sub_divisions = 3
-        else: sub_divisions = 5
-            
-        sub_step = main_step / sub_divisions
-
-        w_label = 3.5 * self.tick_width_scale
-        w_mid = 2.5 * self.tick_width_scale
-        w_small = 1.5 * self.tick_width_scale
-
-        redline_start_val = max_val * 0.8
-        redline_start_angle = 225 - (redline_start_val / max_val) * 270
-        redline_span_angle = -270 * 0.2
-        painter.setPen(QPen(QColor(220, 0, 0, 80), 12, Qt.PenStyle.SolidLine, Qt.PenCapStyle.FlatCap))
-        r_red = radius - 15
-        painter.drawArc(QRectF(-r_red, -r_red, r_red*2, r_red*2), int(redline_start_angle*16), int(redline_span_angle*16))
-
-        current_val = 0
-        while current_val <= max_val + 0.01:
-            angle_rad = np.radians(225 - (current_val / max_val) * 270)
-            cos_a, sin_a = np.cos(angle_rad), np.sin(angle_rad)
-            
-            is_label = abs(current_val % main_step) < 0.01
-            is_mid = abs(current_val % (main_step / 2)) < 0.01 and not is_label
-            if is_mid and sub_divisions % 2 != 0: is_mid = False 
-
-            if is_label:
-                tick_len = 28
-                painter.setPen(QPen(Qt.GlobalColor.white, w_label))
-                p_text = QPointF(cos_a*(radius-65), -sin_a*(radius-65))
-                painter.drawText(QRectF(p_text.x()-35, p_text.y()-15, 70, 30), Qt.AlignmentFlag.AlignCenter, str(int(current_val)))
-            elif is_mid:
-                tick_len = 20
-                painter.setPen(QPen(QColor(200, 200, 200), w_mid))
-            else:
-                tick_len = 12
-                painter.setPen(QPen(QColor(220, 220, 220), w_small))
-            
-            p_outer = QPointF(cos_a*(radius), -sin_a*(radius))
-            p_inner = QPointF(cos_a*(radius-tick_len), -sin_a*(radius-tick_len))
-            painter.drawLine(p_inner, p_outer)
-            current_val += sub_step
-
-        painter.save()
-        current_angle = 225 - (min(speed, self.max_speed) / self.max_speed) * 270
-        painter.rotate(-current_angle + 90)
-        ptr_color = get_speed_color(speed, self.grad_min, self.grad_max)
-        painter.setBrush(ptr_color); painter.setPen(Qt.PenStyle.NoPen)
-        painter.drawPolygon(QPolygonF([QPointF(-9, 0), QPointF(0, -radius+5), QPointF(9, 0)]))
-        painter.restore()
-        
-        painter.setBrush(QColor(60, 60, 60)); painter.setPen(QPen(QColor(30, 30, 30), 2))
-        painter.drawEllipse(QPointF(0,0), 20, 20)
-        painter.setBrush(QColor(30, 30, 30)); painter.setPen(Qt.PenStyle.NoPen)
-        painter.drawEllipse(QPointF(0,0), 12, 12)
-        
-        painter.setFont(self.font_needle_val); painter.setPen(Qt.GlobalColor.white)
-        painter.drawText(QRectF(-150, 60, 300, 80), Qt.AlignmentFlag.AlignCenter, f"{int(speed)}")
-        painter.setFont(self.font_ticks); painter.setPen(QColor(180, 180, 180))
-        painter.drawText(QRectF(-50, 130, 100, 30), Qt.AlignmentFlag.AlignCenter, "KM/H")
 
     def draw_extra_info(self, painter, start_x, start_y, t, sats, alt):
         if not self.icon_clock: return
