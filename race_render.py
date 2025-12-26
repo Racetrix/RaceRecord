@@ -3,17 +3,16 @@ from PyQt6.QtGui import QPainter, QPen, QColor, QFont, QBrush, QPainterPath, QTr
 from PyQt6.QtCore import Qt, QPointF, QRectF
 import qtawesome as qta 
 
-# 🔥 引入新模块
-from race_gauges import DigitalGauge, NeedleGauge, LinearGauge, STYLE_DIGITAL, STYLE_NEEDLE, STYLE_LINEAR
+from race_gauges import DigitalGauge, NeedleGauge, LinearGauge, STYLE_DIGITAL, STYLE_NEEDLE, STYLE_LINEAR, DEFAULT_CONFIGS
+from race_telemetry import GBall, AttitudeIndicator
 
 # ================= 常量定义 =================
 RESOLUTION = (1920, 1080)
 MODE_PATH = 0 
 MODE_GAUGE = 1
 
-# 地图视角
-MAP_STATIC_NORTH = 0  # 北向
-MAP_DYNAMIC_HEAD = 1  # 车头向
+MAP_STATIC_NORTH = 0 
+MAP_DYNAMIC_HEAD = 1 
 
 COLOR_SPEED = 0 
 COLOR_WHITE = 1  
@@ -45,7 +44,7 @@ class Renderer:
         self.car_size = 30        
         self.map_style = MAP_STATIC_NORTH
         
-        self.gauge_style = STYLE_LINEAR # 默认用新样式
+        self.gauge_style = STYLE_LINEAR
         self.max_speed = 200      
         self.show_gauge = True    
         self.show_extra = False    
@@ -53,26 +52,38 @@ class Renderer:
         self.show_sats = True
         self.show_alt = False     
         
-        self.gauge_scale = 1.0      
-        self.gauge_offset_x = 0     
-        self.gauge_offset_y = 0     
-        self.tick_width_scale = 1.0 
+        self.show_gball = False
+        self.show_attitude = False
         
         self.path_color_mode = COLOR_SPEED
         self.grad_min = 0.0
         self.grad_max = 160.0
-        
         self.enable_dynamic_zoom = True
 
-        # 🔥 初始化仪表实例
+        self.gauge_config = {k: v.copy() for k, v in DEFAULT_CONFIGS.items()}
         self.gauges = {
             STYLE_DIGITAL: DigitalGauge(),
             STYLE_NEEDLE: NeedleGauge(),
             STYLE_LINEAR: LinearGauge()
         }
+        
+        self.gball = GBall()
+        self.attitude = AttitudeIndicator()
+        
+        self.telemetry_config = {
+            'gball': {
+                'scale': 1.0, 'x': -350, 'y': 200, 
+                'max_g': 1.5, 
+                'invert_lon': False, 'invert_lat': False, 'swap_axes': False
+            },
+            'attitude': {
+                'scale': 1.0, 'x': 350, 'y': 200, 
+                'max_pitch': 30.0,
+                'invert_roll': False, 'invert_pitch': False
+            }
+        }
 
         self.font_small = QFont("Consolas", 26, QFont.Weight.Bold)
-        
         try:
             self.icon_sat = qta.icon('fa5s.satellite', color='white').pixmap(64, 64)
             self.icon_alt = qta.icon('fa5s.mountain', color='white').pixmap(64, 64)
@@ -103,6 +114,8 @@ class Renderer:
                 self.draw_dynamic_map(painter, w, h, state, current_time, transparent_bg)
         elif render_mode == MODE_GAUGE:
             self.draw_gauge_manual(painter, w, h, state, current_time)
+            
+        self.draw_telemetry(painter, w, h, state)
 
     def get_solid_color(self):
         if self.path_color_mode == COLOR_WHITE: return Qt.GlobalColor.white
@@ -111,9 +124,13 @@ class Renderer:
         return Qt.GlobalColor.white
 
     def draw_path_lines(self, painter, points):
+        # 🔥 安全检查：确保点数和速度数组长度一致
+        limit = min(len(points), len(self.dm.cached_speeds))
+        
         if self.path_color_mode == COLOR_SPEED:
             step = 2
-            for i in range(0, len(points)-step, step):
+            # 这里的 cached_speeds 必须与 points 对应
+            for i in range(0, limit - step, step):
                 spd = self.dm.cached_speeds[i]
                 c = get_speed_color(spd, self.grad_min, self.grad_max)
                 painter.setPen(QPen(c, self.track_width, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
@@ -121,27 +138,76 @@ class Renderer:
         else:
             c = self.get_solid_color()
             painter.setPen(QPen(c, self.track_width, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
-            painter.drawPolyline(points)
+            # 如果是纯色，直接画 Polyline 性能更高
+            if len(points) > 0:
+                painter.drawPolyline(points[:limit])
 
+    # 🔥🔥 修复：使用处理后的 meter_x/y 而不是 raw norm_x/y 🔥🔥
     def draw_static_map(self, painter, w, h, s, transparent_bg):
+        # 1. 使用处理后的米制坐标 (与 cached_speeds 长度一致)
+        mx = self.dm.meter_x
+        my = self.dm.meter_y
+        
+        if mx is None or len(mx) < 2: return # 数据不足
+
+        # 2. 计算边界
+        min_x, max_x = np.min(mx), np.max(mx)
+        min_y, max_y = np.min(my), np.max(my)
+        
+        range_x = max_x - min_x
+        range_y = max_y - min_y
+        
+        # 🔥 3. 这里的保护逻辑：防止静态数据导致除以零
+        if range_x == 0 or range_y == 0:
+            # 如果没有移动，只画车在中间，不画路径
+            car_pos = QPointF(w/2, h/2)
+            painter.setPen(QPen(Qt.GlobalColor.black, 3))
+            painter.setBrush(QBrush(Qt.GlobalColor.white))
+            painter.drawEllipse(car_pos, self.car_size, self.car_size)
+            return
+
+        # 4. 计算缩放比例 (保持比例)
         margin = 60
         avail_w, avail_h = w - margin*2, h - margin*2
-        if avail_w * self.dm.aspect_ratio > avail_h:
-            draw_h = avail_h; draw_w = avail_h / self.dm.aspect_ratio
-        else:
-            draw_w = avail_w; draw_h = avail_w * self.dm.aspect_ratio
-        offset_x, offset_y = (w - draw_w) / 2, (h - draw_h) / 2
-        def to_screen(nx, ny): return QPointF(offset_x + nx * draw_w, h - (offset_y + ny * draw_h))
-
-        points = [to_screen(x, y) for x, y in zip(self.dm.norm_x, self.dm.norm_y)]
         
+        scale_x = avail_w / range_x
+        scale_y = avail_h / range_y
+        scale = min(scale_x, scale_y)
+        
+        # 居中偏移
+        draw_w = range_x * scale
+        draw_h = range_y * scale
+        offset_x = (w - draw_w) / 2
+        offset_y = (h - draw_h) / 2
+
+        # 5. 坐标转换函数
+        # 注意：meter_y 也是笛卡尔坐标(通常北为正)，屏幕坐标Y向下为正
+        # 这里为了保持上方为北，我们需要反转Y轴的映射逻辑
+        # 假设 meter_y[0] 是起点，数值越大越往北
+        # 屏幕上：起点在下，终点在上
+        
+        def to_screen(val_x, val_y):
+            # 归一化 (0~1)
+            nx = (val_x - min_x) / range_x
+            ny = (val_y - min_y) / range_y
+            # 映射屏幕
+            sx = offset_x + nx * draw_w
+            sy = h - (offset_y + ny * draw_h) # Y翻转
+            return QPointF(sx, sy)
+
+        # 6. 生成屏幕点集
+        points = [to_screen(x, y) for x, y in zip(mx, my)]
+        
+        # 绘制背景线
         if not transparent_bg and self.path_color_mode == COLOR_SPEED:
             painter.setPen(QPen(QColor(40, 40, 40), self.track_width + 4, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
             painter.drawPolyline(points)
         
+        # 7. 绘制彩色路径 (现在 points 和 cached_speeds 长度一致了)
         self.draw_path_lines(painter, points)
             
-        car_pos = to_screen(s['nx'], s['ny'])
+        # 8. 绘制车标
+        car_pos = to_screen(s['mx'], s['my'])
         painter.setPen(QPen(Qt.GlobalColor.black, 3))
         painter.setBrush(QBrush(Qt.GlobalColor.white))
         painter.drawEllipse(car_pos, self.car_size, self.car_size)
@@ -174,12 +240,9 @@ class Renderer:
         real_width = self.track_width / zoom
         
         if self.path_color_mode == COLOR_SPEED:
-            step = 2
-            for i in range(0, len(points)-step, step):
-                spd = self.dm.cached_speeds[i]
-                c = get_speed_color(spd, self.grad_min, self.grad_max)
-                painter.setPen(QPen(c, real_width, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
-                painter.drawLine(points[i], points[i+step])
+            # 动态地图使用 draw_path_lines (点和速度本来就对齐)
+            # 但 draw_path_lines 接收的是 QPointF 列表
+            self.draw_path_lines(painter, points)
         else:
             c = self.get_solid_color()
             painter.setPen(QPen(c, real_width, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
@@ -192,21 +255,29 @@ class Renderer:
             
         painter.resetTransform()
 
-    # 🔥🔥 修改：通过代理类绘制仪表 🔥🔥
     def draw_gauge_manual(self, painter, w, h, s, t):
         if self.show_gauge and self.gauge_style in self.gauges:
-            # 1. 绘制速度表
+            config = self.gauge_config[self.gauge_style]
             base_cx = w / 2; base_cy = h / 2
-            target_cx = base_cx + self.gauge_offset_x
-            target_cy = base_cy + self.gauge_offset_y
-            
-            gauge_instance = self.gauges[self.gauge_style]
-            gauge_instance.render(painter, target_cx, target_cy, s['speed'], self.max_speed, self.gauge_scale, self.tick_width_scale)
+            target_cx = base_cx + config['x']
+            target_cy = base_cy + config['y']
+            self.gauges[self.gauge_style].render(painter, target_cx, target_cy, s['speed'], self.max_speed, config)
 
         if self.show_extra:
             start_x = w - 350
             start_y = h - 300
             self.draw_extra_info(painter, start_x, start_y, t, s['sats'], s['alt'])
+            
+    def draw_telemetry(self, painter, w, h, s):
+        base_cx = w / 2; base_cy = h / 2
+        
+        if self.show_gball:
+            cfg = self.telemetry_config['gball']
+            self.gball.render(painter, base_cx + cfg['x'], base_cy + cfg['y'], s, cfg)
+            
+        if self.show_attitude:
+            cfg = self.telemetry_config['attitude']
+            self.attitude.render(painter, base_cx + cfg['x'], base_cy + cfg['y'], s, cfg)
 
     def draw_extra_info(self, painter, start_x, start_y, t, sats, alt):
         if not self.icon_clock: return

@@ -1,141 +1,148 @@
-import numpy as np
 import pandas as pd
+import numpy as np
+from scipy.interpolate import interp1d
 
 class DataManager:
     def __init__(self):
-        self.df_raw = None      
-        self.df_proc = None     
+        self.df_raw = None
+        self.df_proc = None
         self.total_duration = 0
-        self.time_arr = None
-        
-        self.meter_x = None; self.meter_y = None; self.headings = None
-        self.cached_speeds = None; self.cached_sats = None; self.cached_alt = None
-        self.norm_x = None; self.norm_y = None; self.aspect_ratio = 1.0
+        self.aspect_ratio = 1.0
+        # 原始数据数组
+        self.raw_t = np.array([])
+        self.norm_x = np.array([])
+        self.norm_y = np.array([])
+        # 处理后数据数组 (用于快速访问)
+        self.proc_t = None
+        self.cached_speeds = None
+        self.cached_headings = None
+        self.meter_x = None
+        self.meter_y = None
+        # 🔥 新增数据缓存数组
+        self.cached_roll = None
+        self.cached_pitch = None
+        self.cached_lon_g = None
+        self.cached_lat_g = None
+        self.cached_sats = None
+        self.cached_alt = None
 
-    def load_csv(self, path):
-        df = pd.read_csv(path)
-        if 'Fix' in df.columns: df = df[df['Fix'] == 1]
-        df['Time'] = pd.to_datetime(df['Time'])
-        start_time = df['Time'].iloc[0]
-        df['Elapsed'] = (df['Time'] - start_time).dt.total_seconds()
+    def load_csv(self, file_path):
+        # 🔥 更新：增加新列的读取
+        usecols = ['Time', 'Lat', 'Lon', 'Alt', 'Speed_kmh', 'Sats', 'Heading', 'Roll', 'Pitch', 'Lon_G', 'Lat_G']
+        self.df_raw = pd.read_csv(file_path, usecols=usecols)
         
-        self.df_raw = df
-        self.total_duration = df['Elapsed'].max()
-        return len(df), self.total_duration
-
-    def process(self, target_hz, smooth_window):
-        if self.df_raw is None: return
-
-        # 1. 重采样 (Resample)
-        df_tmp = self.df_raw.set_index('Time').copy()
-        if target_hz <= 0: target_hz = 1.0
-        interval_ms = int(1000 / target_hz)
-        rule = f'{interval_ms}ms'
+        self.df_raw['Time'] = pd.to_datetime(self.df_raw['Time'])
+        start_time = self.df_raw['Time'].iloc[0]
+        self.df_raw['RelTime'] = (self.df_raw['Time'] - start_time).dt.total_seconds()
         
-        df_resampled = df_tmp.resample(rule).mean().interpolate()
-        df_resampled = df_resampled.reset_index()
+        self.total_duration = self.df_raw['RelTime'].iloc[-1]
+        self.raw_t = self.df_raw['RelTime'].values
         
-        if len(df_resampled) > 0:
-            start_time = df_resampled['Time'].iloc[0]
-            df_resampled['Elapsed'] = (df_resampled['Time'] - start_time).dt.total_seconds()
+        # 归一化经纬度 (用于静态地图)
+        lat = self.df_raw['Lat'].values
+        lon = self.df_raw['Lon'].values
         
-        # 2. 基础数据平滑 (位置/速度)
-        window = max(1, int(smooth_window))
-        cols = ['Lat', 'Lon', 'Speed_kmh']
-        if 'Alt' in df_resampled.columns: cols.append('Alt')
-        smoothed = df_resampled[cols].rolling(window=window, min_periods=1, center=True).mean()
-        df_resampled[cols] = smoothed
+        # 🔥 安全检查：防止数据全为0导致除以零错误
+        lat_range = lat.max() - lat.min()
+        lon_range = lon.max() - lon.min()
         
-        self.df_proc = df_resampled
-        self.time_arr = df_resampled['Elapsed'].values
-
-        # 3. 投影 (Lat/Lon -> Meters)
-        mid_lat = df_resampled['Lat'].mean()
-        mid_lon = df_resampled['Lon'].mean()
-        R = 6371000
-        x = (df_resampled['Lon'] - mid_lon) * (np.pi/180) * R * np.cos(mid_lat * np.pi/180)
-        y = (df_resampled['Lat'] - mid_lat) * (np.pi/180) * R
-        
-        self.meter_x = x.values
-        self.meter_y = y.values
-        
-        min_x, max_x = x.min(), x.max()
-        min_y, max_y = y.min(), y.max()
-        range_x = max_x - min_x or 1
-        range_y = max_y - min_y or 1
-        self.norm_x = ((x - min_x) / range_x).values
-        self.norm_y = ((y - min_y) / range_y).values
-        self.aspect_ratio = range_y / range_x
-
-        # 4. 🔥🔥🔥 核心升级：速度加权矢量平滑 (Speed-Weighted Vector Smoothing) 🔥🔥🔥
-        
-        # (1) 计算基础位移向量
-        dx = np.gradient(self.meter_x)
-        dy = np.gradient(self.meter_y)
-        
-        # (2) 获取速度权重 (Speed Weighting)
-        # 速度越快，权重越大；速度越慢，权重越小 (平方处理以增强对比)
-        speeds = df_resampled['Speed_kmh'].values
-        # 加上一个小数值防止除以0，并做平方处理增强高信噪比区域的权重
-        weights = np.square(speeds + 1.0) 
-        
-        # (3) 加权向量
-        w_dx = dx * weights
-        w_dy = dy * weights
-        
-        # (4) 对加权向量进行大窗口平滑
-        # 这里的窗口要大，因为它不仅平滑噪点，还负责连接入弯和出弯的趋势
-        vec_window = max(5, window * 3) 
-        
-        smooth_w_dx = pd.Series(w_dx).rolling(vec_window, min_periods=1, center=True).mean().values
-        smooth_w_dy = pd.Series(w_dy).rolling(vec_window, min_periods=1, center=True).mean().values
-        
-        # (5) 计算最终角度
-        # 在弯心速度极低时，smooth_w_dx/dy 依然会保留入弯时的大权重惯性，
-        # 直到出弯加速后的新权重占据主导，从而实现完美过渡。
-        raw_angles = np.degrees(np.arctan2(smooth_w_dy, smooth_w_dx))
-        self.headings = np.degrees(np.unwrap(np.radians(raw_angles)))
-
-        # 缓存
-        self.cached_speeds = speeds
-        self.cached_sats = df_resampled['Sats'].values if 'Sats' in df_resampled else np.zeros(len(df_resampled))
-        self.cached_alt = df_resampled['Alt'].values if 'Alt' in df_resampled else np.zeros(len(df_resampled))
-
-    def get_state_at_time(self, t):
-        if self.time_arr is None or len(self.time_arr) == 0: return None
-        
-        idx = np.searchsorted(self.time_arr, t)
-        max_idx = len(self.time_arr) - 1
-        
-        if idx > max_idx: idx = max_idx; return self._pack_state(idx, idx, 0)
-        if idx == 0: return self._pack_state(0, 0, 0)
+        if lat_range == 0 or lon_range == 0:
+             # 如果没有有效的GPS移动数据，设置默认值
+             self.norm_x = np.zeros_like(lon)
+             self.norm_y = np.zeros_like(lat)
+             self.aspect_ratio = 1.0
+             print("警告：经纬度数据无效或无移动，静态地图将不可用。")
+        else:
+            self.norm_y = (lat - lat.min()) / lat_range
+            self.norm_x = (lon - lon.min()) / lon_range
             
-        t0 = self.time_arr[idx-1]
-        t1 = self.time_arr[idx]
-        alpha = (t - t0) / (t1 - t0) if t1 > t0 else 0
-        
-        return self._pack_state(idx-1, idx, alpha)
+            mid_lat = np.radians(lat.mean())
+            lat_m = lat_range * 111320
+            lon_m = lon_range * 111320 * np.cos(mid_lat)
+            self.aspect_ratio = lat_m / lon_m if lon_m != 0 else 1.0
 
-    def _pack_state(self, i0, i1, alpha):
-        N = len(self.meter_x)
-        i0 = min(i0, N-1); i1 = min(i1, N-1)
+        return len(self.df_raw), self.total_duration
+
+    def process(self, target_hz=60.0, smooth_window=5):
+        if self.df_raw is None: return
         
-        mx = self.meter_x[i0] * (1-alpha) + self.meter_x[i1] * alpha
-        my = self.meter_y[i0] * (1-alpha) + self.meter_y[i1] * alpha
+        new_t = np.arange(0, self.total_duration, 1/target_hz)
+        self.proc_t = new_t
         
-        nx = self.norm_x[i0] * (1-alpha) + self.norm_x[i1] * alpha
-        ny = self.norm_y[i0] * (1-alpha) + self.norm_y[i1] * alpha
+        # 需要插值和存在的列
+        cols_to_interp = {
+            'Lat': 'lat', 'Lon': 'lon', 'Alt': 'alt', 
+            'Speed_kmh': 'speed', 'Sats': 'sats', 'Heading': 'heading',
+            'Roll': 'roll', 'Pitch': 'pitch', 'Lon_G': 'lon_g', 'Lat_G': 'lat_g'
+        }
         
-        spd = self.cached_speeds[i0] * (1-alpha) + self.cached_speeds[i1] * alpha
+        interp_data = {}
+        for col, key in cols_to_interp.items():
+            if col in self.df_raw.columns:
+                f = interp1d(self.raw_t, self.df_raw[col].values, kind='linear', fill_value="extrapolate")
+                interp_data[key] = f(new_t)
+            else:
+                # 如果CSV里缺少某列，填充0
+                interp_data[key] = np.zeros_like(new_t)
+
+        self.df_proc = pd.DataFrame(interp_data)
         
-        # 简单的线性插值即可，因为数据已经极其平滑
-        heading = self.headings[i0] * (1-alpha) + self.headings[i1] * alpha
+        # 🔥 更新：对新数据也进行平滑处理
+        # Heading 需要特殊平滑处理(角度回绕)，这里暂时简单平均，未来可优化
+        cols_to_smooth = ['speed', 'alt', 'heading', 'roll', 'pitch', 'lon_g', 'lat_g']
+        if smooth_window > 1:
+            # 确保窗口是奇数
+            window = smooth_window if smooth_window % 2 != 0 else smooth_window + 1
+            for col in cols_to_smooth:
+                self.df_proc[col] = self.df_proc[col].rolling(window=window, center=True, min_periods=1).mean()
         
-        sats = self.cached_sats[i1]
-        alt = self.cached_alt[i0] * (1-alpha) + self.cached_alt[i1] * alpha
+        # 计算米制坐标 (用于动态地图)
+        if 'lat' in self.df_proc and 'lon' in self.df_proc:
+            lat_p = self.df_proc['lat'].values
+            lon_p = self.df_proc['lon'].values
+            mid_lat_rad = np.radians(lat_p.mean())
+            self.meter_y = (lat_p - lat_p[0]) * 111320
+            self.meter_x = (lon_p - lon_p[0]) * 111320 * np.cos(mid_lat_rad)
+        else:
+             self.meter_x = np.zeros_like(new_t)
+             self.meter_y = np.zeros_like(new_t)
+
+        # 缓存常用数据
+        self.cached_speeds = self.df_proc['speed'].values
+        self.cached_headings = self.df_proc['heading'].values
+        # 🔥 缓存新数据
+        self.cached_roll = self.df_proc['roll'].values
+        self.cached_pitch = self.df_proc['pitch'].values
+        self.cached_lon_g = self.df_proc['lon_g'].values
+        self.cached_lat_g = self.df_proc['lat_g'].values
+        self.cached_sats = self.df_proc['sats'].values
+        self.cached_alt = self.df_proc['alt'].values
+        
+        self.df_proc.fillna(0, inplace=True)
+
+    def get_state_at_time(self, t_target):
+        if self.proc_t is None: return None
+        idx = np.searchsorted(self.proc_t, t_target)
+        if idx >= len(self.proc_t): idx = len(self.proc_t) - 1
+        
+        row = self.df_proc.iloc[idx]
+        
+        # 获取静态地图归一化坐标
+        raw_idx = np.searchsorted(self.raw_t, t_target)
+        if raw_idx >= len(self.raw_t): raw_idx = len(self.raw_t) - 1
         
         return {
-            'mx': mx, 'my': my, 'nx': nx, 'ny': ny,
-            'speed': spd, 'heading': heading,
-            'sats': sats, 'alt': alt
+            'speed': row['speed'],
+            'heading': row['heading'],
+            'sats': row['sats'],
+            'alt': row['alt'],
+            # 🔥 返回新数据
+            'roll': row['roll'],
+            'pitch': row['pitch'],
+            'lon_g': row['lon_g'],
+            'lat_g': row['lat_g'],
+            'mx': self.meter_x[idx],
+            'my': self.meter_y[idx],
+            'nx': self.norm_x[raw_idx],
+            'ny': self.norm_y[raw_idx]
         }

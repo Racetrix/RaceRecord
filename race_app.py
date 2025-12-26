@@ -15,9 +15,9 @@ from PyQt6.QtGui import QPainter, QImage, QColor, QFont, QPen, QLinearGradient, 
 from PyQt6.QtCore import Qt, QTimer, QThread, pyqtSignal, QPointF, QRectF
 
 from race_data import DataManager
-from race_render import Renderer, qimage_to_numpy, MODE_PATH, MODE_GAUGE, STYLE_DIGITAL, STYLE_NEEDLE, MAP_STATIC_NORTH, MAP_DYNAMIC_HEAD, COLOR_SPEED, COLOR_WHITE, COLOR_RED, COLOR_CYAN, RESOLUTION
+from race_render import Renderer, qimage_to_numpy, MODE_PATH, MODE_GAUGE, STYLE_DIGITAL, STYLE_NEEDLE, STYLE_LINEAR, MAP_STATIC_NORTH, MAP_DYNAMIC_HEAD, COLOR_SPEED, COLOR_WHITE, COLOR_RED, COLOR_CYAN, RESOLUTION
 from race_intro import IntroRenderer, INTRO_NAMES, INTRO_CLASSIC
-from race_gauges import GAUGE_NAMES, STYLE_LINEAR
+from race_gauges import GAUGE_NAMES, STYLE_DIGITAL, STYLE_NEEDLE, STYLE_LINEAR
 
 STYLESHEET = """
 QMainWindow { background-color: #181818; }
@@ -49,6 +49,7 @@ QCheckBox::indicator:checked { background: #4EC9B0; border-color: #4EC9B0; image
 QScrollArea { border: none; background: transparent; }
 """
 
+# ... (RecorderWorker 保持不变) ...
 class RecorderWorker(QThread):
     progress = pyqtSignal(int)
     finished = pyqtSignal(str)
@@ -56,21 +57,15 @@ class RecorderWorker(QThread):
     
     def __init__(self, renderer, intro_renderer, output_path, transparent, render_mode, fps, show_intro, intro_style, logo_size):
         super().__init__()
-        self.renderer = renderer
-        self.intro_renderer = intro_renderer
-        self.path = output_path
-        self.transparent = transparent
-        self.render_mode = render_mode
-        self.fps = fps
-        self.show_intro = show_intro
-        self.intro_style = intro_style
-        self.logo_size = logo_size
-        self.is_running = True
+        self.renderer = renderer; self.intro_renderer = intro_renderer
+        self.path = output_path; self.transparent = transparent
+        self.render_mode = render_mode; self.fps = fps
+        self.show_intro = show_intro; self.intro_style = intro_style
+        self.logo_size = logo_size; self.is_running = True
 
     def run(self):
         try:
             w, h = RESOLUTION
-            # 修复：分行写
             if w % 2 != 0: w -= 1
             if h % 2 != 0: h -= 1
             
@@ -123,6 +118,7 @@ class RecorderWorker(QThread):
 
     def stop(self): self.is_running = False
 
+# ... (RaceCanvas 保持不变) ...
 class RaceCanvas(QWidget):
     def __init__(self, renderer, intro_renderer):
         super().__init__()
@@ -153,7 +149,7 @@ class RaceCanvas(QWidget):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Racetrix v43.2 - 语法终极修复版")
+        self.setWindowTitle("Racetrix v45.0 - 专业遥测版")
         self.resize(1350, 900)
         self.setStyleSheet(STYLESHEET)
         
@@ -166,12 +162,15 @@ class MainWindow(QMainWindow):
         self.recorder = None
         self.logo_size_state = {'val': 140}
         
+        self.gauge_settings_layout = None
+        # 🔥 新增：遥测设置布局
+        self.telemetry_settings_layout = None
+        
         self.playback_timer = QTimer(); self.playback_timer.timeout.connect(self.update_playback)
         self.init_ui()
 
     def add_stepper(self, layout, label_text, min_val, max_val, current_val, step, callback, is_float=False):
-        row = QHBoxLayout()
-        row.setContentsMargins(0,0,0,0)
+        row = QHBoxLayout(); row.setContentsMargins(0,0,0,0)
         lbl_title = QLabel(label_text)
         lbl_val = QLabel(f"{current_val}")
         lbl_val.setFixedWidth(50)
@@ -199,90 +198,68 @@ class MainWindow(QMainWindow):
     def init_ui(self):
         main_widget = QWidget(); layout = QHBoxLayout(); layout.setContentsMargins(0,0,0,0)
         self.canvas = RaceCanvas(self.renderer, self.intro_renderer)
-        
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setFixedWidth(400)
-        
-        ctrl_content = QWidget()
-        ctrl_panel = QVBoxLayout(ctrl_content)
-        ctrl_content.setStyleSheet("background-color: #1E1E1E;")
-        ctrl_panel.setSpacing(12)
-        
-        title = QLabel("RACE CONTROLLER", objectName="title")
-        ctrl_panel.addWidget(title)
+        scroll = QScrollArea(); scroll.setWidgetResizable(True); scroll.setFixedWidth(430) # 稍微加宽一点
+        ctrl_content = QWidget(); ctrl_panel = QVBoxLayout(ctrl_content)
+        ctrl_content.setStyleSheet("background-color: #1E1E1E;"); ctrl_panel.setSpacing(12)
+        title = QLabel("RACE CONTROLLER", objectName="title"); ctrl_panel.addWidget(title)
 
-        gb_data = QGroupBox("数据源")
-        l_data = QVBoxLayout()
-        hl_file = QHBoxLayout()
+        gb_data = QGroupBox("数据源"); l_data = QVBoxLayout(); hl_file = QHBoxLayout()
         self.btn_load = QPushButton("📂 加载 CSV"); self.btn_load.clicked.connect(self.load_csv)
-        self.lbl_info = QLabel("未加载")
-        self.lbl_info.setStyleSheet("color: #666; font-size: 12px;")
+        self.lbl_info = QLabel("未加载"); self.lbl_info.setStyleSheet("color: #666; font-size: 12px;")
         hl_file.addWidget(self.btn_load); hl_file.addWidget(self.lbl_info)
         l_data.addLayout(hl_file)
         self.add_stepper(l_data, "重采样 (Hz)", 0.5, 50.0, 5.0, 0.5, self.set_hz, is_float=True)
         self.add_stepper(l_data, "平滑窗口", 1, 50, 5, 1, self.set_smooth)
         gb_data.setLayout(l_data); ctrl_panel.addWidget(gb_data)
 
-        hl_mode = QHBoxLayout()
-        hl_mode.addWidget(QLabel("渲染模式:"))
-        self.combo_mode = QComboBox()
-        self.combo_mode.addItem("🗺️ 仅路径模式", MODE_PATH)
-        self.combo_mode.addItem("📟 仅仪表模式", MODE_GAUGE)
+        hl_mode = QHBoxLayout(); hl_mode.addWidget(QLabel("渲染模式:"))
+        self.combo_mode = QComboBox(); self.combo_mode.addItem("🗺️ 仅路径模式", MODE_PATH); self.combo_mode.addItem("📟 仅仪表模式", MODE_GAUGE)
         self.combo_mode.currentIndexChanged.connect(self.switch_mode)
-        hl_mode.addWidget(self.combo_mode)
-        ctrl_panel.addLayout(hl_mode)
+        hl_mode.addWidget(self.combo_mode); ctrl_panel.addLayout(hl_mode)
 
         self.stack_settings = QStackedWidget()
         
-        # Panel 1
+        # Panel 1: 路径 (保持不变)
         p1 = QWidget(); l1 = QVBoxLayout(); l1.setContentsMargins(0,0,0,0); l1.setSpacing(10)
-        gb1 = QGroupBox("路径参数")
-        gl1 = QVBoxLayout(); gl1.setAlignment(Qt.AlignmentFlag.AlignTop)
+        gb1 = QGroupBox("路径参数"); gl1 = QVBoxLayout(); gl1.setAlignment(Qt.AlignmentFlag.AlignTop)
         self.combo_map_style = QComboBox()
         self.combo_map_style.addItem("🌐 静态 (北向)", MAP_STATIC_NORTH)
         self.combo_map_style.addItem("🦅 动态 (车头向)", MAP_DYNAMIC_HEAD)
         self.combo_map_style.currentIndexChanged.connect(self.update_settings)
-        gl1.addWidget(QLabel("地图视角:"))
-        gl1.addWidget(self.combo_map_style)
-        self.chk_zoom = QCheckBox("动感呼吸缩放 (Breathing Zoom)")
-        self.chk_zoom.setChecked(True)
+        gl1.addWidget(QLabel("地图视角:")); gl1.addWidget(self.combo_map_style)
+        self.chk_zoom = QCheckBox("动感呼吸缩放 (Breathing Zoom)"); self.chk_zoom.setChecked(True)
         self.chk_zoom.stateChanged.connect(lambda: setattr(self.renderer, 'enable_dynamic_zoom', self.chk_zoom.isChecked()) or self.canvas.update())
         gl1.addWidget(self.chk_zoom)
         self.combo_path_color = QComboBox()
-        self.combo_path_color.addItem("🌈 速度渐变", COLOR_SPEED)
-        self.combo_path_color.addItem("⚪ 纯白", COLOR_WHITE)
-        self.combo_path_color.addItem("🔴 纯红", COLOR_RED)
-        self.combo_path_color.addItem("🔵 赛博青", COLOR_CYAN)
+        self.combo_path_color.addItem("🌈 速度渐变", COLOR_SPEED); self.combo_path_color.addItem("⚪ 纯白", COLOR_WHITE)
+        self.combo_path_color.addItem("🔴 纯红", COLOR_RED); self.combo_path_color.addItem("🔵 赛博青", COLOR_CYAN)
         self.combo_path_color.currentIndexChanged.connect(self.update_settings)
-        gl1.addWidget(QLabel("轨迹配色:"))
-        gl1.addWidget(self.combo_path_color)
+        gl1.addWidget(QLabel("轨迹配色:")); gl1.addWidget(self.combo_path_color)
         self.add_stepper(gl1, "渐变起始 (Min)", 0, 300, 0, 10, lambda v: setattr(self.renderer, 'grad_min', v) or self.canvas.update())
         self.add_stepper(gl1, "渐变结束 (Max)", 10, 400, 160, 10, lambda v: setattr(self.renderer, 'grad_max', v) or self.canvas.update())
         self.add_stepper(gl1, "路径粗细", 1, 50, 15, 1, lambda v: setattr(self.renderer, 'track_width', v) or self.canvas.update())
         self.add_stepper(gl1, "车标大小", 5, 100, 30, 2, lambda v: setattr(self.renderer, 'car_size', v) or self.canvas.update())
         gb1.setLayout(gl1); l1.addWidget(gb1); l1.addStretch(); p1.setLayout(l1); self.stack_settings.addWidget(p1)
 
-        # Panel 2
+        # Panel 2: 仪表 (包含动态面板)
         p2 = QWidget(); l2 = QVBoxLayout(); l2.setContentsMargins(0,0,0,0); l2.setSpacing(10)
-        gb_layout = QGroupBox("布局调节")
-        gl_layout = QVBoxLayout()
-        self.add_stepper(gl_layout, "整体缩放", 0.2, 3.0, 1.0, 0.1, lambda v: setattr(self.renderer, 'gauge_scale', v) or self.canvas.update(), True)
-        self.add_stepper(gl_layout, "位置 X", -900, 900, 0, 20, lambda v: setattr(self.renderer, 'gauge_offset_x', v) or self.canvas.update())
-        self.add_stepper(gl_layout, "位置 Y", -900, 900, 0, 20, lambda v: setattr(self.renderer, 'gauge_offset_y', v) or self.canvas.update())
-        self.add_stepper(gl_layout, "刻度粗细", 0.5, 5.0, 1.0, 0.5, lambda v: setattr(self.renderer, 'tick_width_scale', v) or self.canvas.update(), True)
-        gb_layout.setLayout(gl_layout); l2.addWidget(gb_layout)
-        gb2 = QGroupBox("显示参数")
-        gl2 = QVBoxLayout()
-        self.chk_show_gauge = QCheckBox("显示速度表"); self.chk_show_gauge.setChecked(True); self.chk_show_gauge.stateChanged.connect(self.update_settings)
-        gl2.addWidget(self.chk_show_gauge)
         
+        gb_style = QGroupBox("仪表样式"); gl_style = QVBoxLayout()
         self.combo_style = QComboBox()
         for k, v in GAUGE_NAMES.items(): self.combo_style.addItem(v, k)
-        self.combo_style.setCurrentIndex(STYLE_LINEAR) 
-        self.combo_style.currentIndexChanged.connect(self.update_settings)
-        gl2.addWidget(self.combo_style)
-        
+        self.combo_style.setCurrentIndex(STYLE_LINEAR)
+        self.combo_style.currentIndexChanged.connect(self.rebuild_gauge_panel) 
+        gl_style.addWidget(self.combo_style)
+        gb_style.setLayout(gl_style); l2.addWidget(gb_style)
+
+        self.gb_dynamic = QGroupBox("布局调节")
+        self.gauge_settings_layout = QVBoxLayout()
+        self.gb_dynamic.setLayout(self.gauge_settings_layout)
+        l2.addWidget(self.gb_dynamic)
+
+        gb2 = QGroupBox("显示参数"); gl2 = QVBoxLayout()
+        self.chk_show_gauge = QCheckBox("显示速度表"); self.chk_show_gauge.setChecked(True); self.chk_show_gauge.stateChanged.connect(self.update_settings)
+        gl2.addWidget(self.chk_show_gauge)
         self.add_stepper(gl2, "表底速度", 60, 400, 200, 20, lambda v: setattr(self.renderer, 'max_speed', v) or self.canvas.update())
         self.chk_show_extra = QCheckBox("显示额外信息栏"); self.chk_show_extra.setChecked(False); self.chk_show_extra.stateChanged.connect(self.update_settings)
         gl2.addWidget(self.chk_show_extra)
@@ -292,56 +269,156 @@ class MainWindow(QMainWindow):
         self.chk_alt = QCheckBox("高度"); self.chk_alt.setChecked(False); self.chk_alt.stateChanged.connect(self.update_settings)
         sub_info.addWidget(self.chk_time); sub_info.addWidget(self.chk_sats); sub_info.addWidget(self.chk_alt)
         gl2.addLayout(sub_info)
-        gb2.setLayout(gl2); l2.addWidget(gb2); l2.addStretch(); p2.setLayout(l2); self.stack_settings.addWidget(p2)
+        gb2.setLayout(gl2); l2.addWidget(gb2)
+
+        # 🔥🔥 新增：专业遥测面板 🔥🔥
+        gb_tele = QGroupBox("专业遥测 (G-Force & Attitude)"); gl_tele = QVBoxLayout()
+        
+        # G-Ball 开关和设置
+        hl_gball = QHBoxLayout()
+        self.chk_show_gball = QCheckBox("显示 G 值球 (G-Ball)")
+        self.chk_show_gball.stateChanged.connect(self.update_settings)
+        hl_gball.addWidget(self.chk_show_gball)
+        self.btn_gball_settings = QPushButton("⚙️ 设置")
+        self.btn_gball_settings.setFixedWidth(60)
+        self.btn_gball_settings.clicked.connect(self.toggle_gball_settings)
+        hl_gball.addWidget(self.btn_gball_settings)
+        gl_tele.addLayout(hl_gball)
+        
+        # G-Ball 动态设置区域
+        self.container_gball = QWidget(); self.layout_gball = QVBoxLayout(self.container_gball)
+        self.container_gball.setVisible(False) # 默认隐藏
+        gl_tele.addWidget(self.container_gball)
+
+        # 姿态仪 开关和设置
+        hl_att = QHBoxLayout()
+        self.chk_show_attitude = QCheckBox("显示 姿态仪 (Attitude)")
+        self.chk_show_attitude.stateChanged.connect(self.update_settings)
+        hl_att.addWidget(self.chk_show_attitude)
+        self.btn_att_settings = QPushButton("⚙️ 设置")
+        self.btn_att_settings.setFixedWidth(60)
+        self.btn_att_settings.clicked.connect(self.toggle_att_settings)
+        hl_att.addWidget(self.btn_att_settings)
+        gl_tele.addLayout(hl_att)
+
+        # 姿态仪 动态设置区域
+        self.container_att = QWidget(); self.layout_att = QVBoxLayout(self.container_att)
+        self.container_att.setVisible(False) # 默认隐藏
+        gl_tele.addWidget(self.container_att)
+
+        gb_tele.setLayout(gl_tele); l2.addWidget(gb_tele)
+
+        l2.addStretch()
+        p2.setLayout(l2); self.stack_settings.addWidget(p2)
         
         ctrl_panel.addWidget(self.stack_settings)
 
-        # 播放 & 录制
-        gb_ctrl = QGroupBox("时间轴")
-        cl = QVBoxLayout()
-        hl_play = QHBoxLayout()
-        self.btn_play = QPushButton("▶ 播放"); self.btn_play.setFixedWidth(80)
-        self.btn_play.clicked.connect(self.toggle_play)
+        # 播放 & 录制 (保持不变)
+        gb_ctrl = QGroupBox("时间轴"); cl = QVBoxLayout(); hl_play = QHBoxLayout()
+        self.btn_play = QPushButton("▶ 播放"); self.btn_play.setFixedWidth(80); self.btn_play.clicked.connect(self.toggle_play)
         self.slider = QSlider(Qt.Orientation.Horizontal); self.slider.sliderMoved.connect(self.seek)
         hl_play.addWidget(self.btn_play); hl_play.addWidget(self.slider)
         gb_ctrl.setLayout(hl_play); ctrl_panel.addWidget(gb_ctrl)
         
-        gb_export = QGroupBox("导出与片头")
-        el = QVBoxLayout()
-        hl_opt = QHBoxLayout()
+        gb_export = QGroupBox("导出与片头"); el = QVBoxLayout(); hl_opt = QHBoxLayout()
         self.rb_trans = QRadioButton("透明"); self.rb_black = QRadioButton("黑底"); self.rb_trans.setChecked(True)
         bgg = QButtonGroup(self); bgg.addButton(self.rb_trans); bgg.addButton(self.rb_black)
         self.combo_fps = QComboBox(); self.combo_fps.addItems(["30 FPS", "60 FPS"]); self.combo_fps.setCurrentIndex(1)
         hl_opt.addWidget(self.rb_trans); hl_opt.addWidget(self.rb_black); hl_opt.addStretch(); hl_opt.addWidget(self.combo_fps)
         el.addLayout(hl_opt)
-        
-        self.chk_show_intro = QCheckBox("显示 Racetrix 片头 (Intro)")
-        self.chk_show_intro.setChecked(True)
-        self.chk_show_intro.stateChanged.connect(self.update_settings)
-        el.addWidget(self.chk_show_intro)
-        
-        hl_intro = QHBoxLayout()
-        self.combo_intro_style = QComboBox()
+        self.chk_show_intro = QCheckBox("显示 Racetrix 片头 (Intro)"); self.chk_show_intro.setChecked(True); self.chk_show_intro.stateChanged.connect(self.update_settings); el.addWidget(self.chk_show_intro)
+        hl_intro = QHBoxLayout(); self.combo_intro_style = QComboBox()
         for k, v in INTRO_NAMES.items(): self.combo_intro_style.addItem(v, k)
         self.combo_intro_style.currentIndexChanged.connect(self.update_settings)
-        hl_intro.addWidget(QLabel("样式:"))
-        hl_intro.addWidget(self.combo_intro_style)
-        el.addLayout(hl_intro)
-        
+        hl_intro.addWidget(QLabel("样式:")); hl_intro.addWidget(self.combo_intro_style); el.addLayout(hl_intro)
         self.logo_size_state = self.add_stepper(el, "Logo 字号", 50, 300, 140, 10, lambda v: self.update_settings())
         el.addWidget(QLabel("💡 保持开启可帮助 Racetrix 提升知名度，感谢支持！", objectName="help_text"))
-        
-        self.btn_snap = QPushButton("📸 生成路径封面图"); self.btn_snap.setObjectName("btn_snap"); self.btn_snap.clicked.connect(self.generate_cover_image)
-        el.addWidget(self.btn_snap)
+        self.btn_snap = QPushButton("📸 生成路径封面图"); self.btn_snap.setObjectName("btn_snap"); self.btn_snap.clicked.connect(self.generate_cover_image); el.addWidget(self.btn_snap)
         self.btn_record = QPushButton("⏺ 开始渲染视频"); self.btn_record.setObjectName("btn_record"); self.btn_record.clicked.connect(self.toggle_record)
-        self.progress = QProgressBar(); self.progress.setValue(0)
-        el.addWidget(self.btn_record); el.addWidget(self.progress)
+        self.progress = QProgressBar(); self.progress.setValue(0); el.addWidget(self.btn_record); el.addWidget(self.progress)
         gb_export.setLayout(el); ctrl_panel.addWidget(gb_export)
 
         ctrl_panel.addStretch()
         scroll.setWidget(ctrl_content)
         layout.addWidget(self.canvas, 1); layout.addWidget(scroll)
         main_widget.setLayout(layout); self.setCentralWidget(main_widget)
+        
+        self.rebuild_gauge_panel()
+        self.rebuild_telemetry_panels() # 构建遥测面板
+
+    # 🔥 切换 G-Ball 设置面板的显示
+    def toggle_gball_settings(self):
+        self.container_gball.setVisible(not self.container_gball.isVisible())
+    
+    # 🔥 切换 姿态仪 设置面板的显示
+    def toggle_att_settings(self):
+        self.container_att.setVisible(not self.container_att.isVisible())
+
+    # 🔥🔥🔥 构建遥测设置面板 🔥🔥🔥
+    def rebuild_telemetry_panels(self):
+        # --- G-Ball 面板 ---
+        cfg_g = self.renderer.telemetry_config['gball']
+        def update_g(key, val): cfg_g[key] = val; self.canvas.update()
+        
+        self.add_stepper(self.layout_gball, "缩放", 0.5, 2.0, cfg_g['scale'], 0.1, lambda v: update_g('scale', v), True)
+        self.add_stepper(self.layout_gball, "位置 X", -900, 900, cfg_g['x'], 20, lambda v: update_g('x', v))
+        self.add_stepper(self.layout_gball, "位置 Y", -900, 900, cfg_g['y'], 20, lambda v: update_g('y', v))
+        self.add_stepper(self.layout_gball, "最大 G 值", 0.5, 5.0, cfg_g['max_g'], 0.1, lambda v: update_g('max_g', v), True)
+        
+        hl_g_opts = QHBoxLayout()
+        chk_swap = QCheckBox("交换 X/Y轴"); chk_swap.setChecked(cfg_g['swap_axes']); chk_swap.stateChanged.connect(lambda v: update_g('swap_axes', bool(v)))
+        chk_inv_lon = QCheckBox("反转纵向"); chk_inv_lon.setChecked(cfg_g['invert_lon']); chk_inv_lon.stateChanged.connect(lambda v: update_g('invert_lon', bool(v)))
+        chk_inv_lat = QCheckBox("反转横向"); chk_inv_lat.setChecked(cfg_g['invert_lat']); chk_inv_lat.stateChanged.connect(lambda v: update_g('invert_lat', bool(v)))
+        hl_g_opts.addWidget(chk_swap); hl_g_opts.addWidget(chk_inv_lon); hl_g_opts.addWidget(chk_inv_lat)
+        self.layout_gball.addLayout(hl_g_opts)
+
+        # --- 姿态仪 面板 ---
+        cfg_a = self.renderer.telemetry_config['attitude']
+        def update_a(key, val): cfg_a[key] = val; self.canvas.update()
+        
+        self.add_stepper(self.layout_att, "缩放", 0.5, 2.0, cfg_a['scale'], 0.1, lambda v: update_a('scale', v), True)
+        self.add_stepper(self.layout_att, "位置 X", -900, 900, cfg_a['x'], 20, lambda v: update_a('x', v))
+        self.add_stepper(self.layout_att, "位置 Y", -900, 900, cfg_a['y'], 20, lambda v: update_a('y', v))
+        self.add_stepper(self.layout_att, "最大俯仰角", 10, 90, cfg_a['max_pitch'], 5, lambda v: update_a('max_pitch', v))
+        
+        hl_a_opts = QHBoxLayout()
+        chk_inv_roll = QCheckBox("反转横滚(Roll)"); chk_inv_roll.setChecked(cfg_a['invert_roll']); chk_inv_roll.stateChanged.connect(lambda v: update_a('invert_roll', bool(v)))
+        chk_inv_pitch = QCheckBox("反转俯仰(Pitch)"); chk_inv_pitch.setChecked(cfg_a['invert_pitch']); chk_inv_pitch.stateChanged.connect(lambda v: update_a('invert_pitch', bool(v)))
+        hl_a_opts.addWidget(chk_inv_roll); hl_a_opts.addWidget(chk_inv_pitch)
+        self.layout_att.addLayout(hl_a_opts)
+
+    def rebuild_gauge_panel(self):
+        while self.gauge_settings_layout.count():
+            item = self.gauge_settings_layout.takeAt(0)
+            widget = item.widget()
+            if widget: widget.deleteLater()
+            
+        style_idx = self.combo_style.currentData()
+        config = self.renderer.gauge_config[style_idx]
+        
+        def update_cfg(key, val):
+            config[key] = val
+            self.canvas.update()
+
+        # 通用
+        self.add_stepper(self.gauge_settings_layout, "缩放 (Scale)", 0.2, 3.0, config['scale'], 0.1, lambda v: update_cfg('scale', v), True)
+        self.add_stepper(self.gauge_settings_layout, "位置 X", -900, 900, config['x'], 20, lambda v: update_cfg('x', v))
+        self.add_stepper(self.gauge_settings_layout, "位置 Y", -900, 900, config['y'], 20, lambda v: update_cfg('y', v))
+        
+        # 特有
+        if style_idx == STYLE_DIGITAL:
+            self.add_stepper(self.gauge_settings_layout, "圆环粗细", 5, 100, config['ring_width'], 5, lambda v: update_cfg('ring_width', v))
+            
+        elif style_idx == STYLE_NEEDLE:
+            self.add_stepper(self.gauge_settings_layout, "刻度粗细", 0.5, 5.0, config['tick_width'], 0.5, lambda v: update_cfg('tick_width', v), True)
+            self.add_stepper(self.gauge_settings_layout, "指针粗细", 0.5, 5.0, config['pointer_width'], 0.5, lambda v: update_cfg('pointer_width', v), True)
+            
+        elif style_idx == STYLE_LINEAR:
+            self.add_stepper(self.gauge_settings_layout, "进度条高度", 5, 100, config['bar_height'], 5, lambda v: update_cfg('bar_height', v))
+            # 🔥 新增：刻度密度调节
+            self.add_stepper(self.gauge_settings_layout, "刻度密度", 2, 50, config['tick_density'], 1, lambda v: update_cfg('tick_density', v))
+
+        self.update_settings()
 
     def update_settings(self):
         self.renderer.map_style = self.combo_map_style.currentData()
@@ -353,10 +430,13 @@ class MainWindow(QMainWindow):
         self.renderer.show_sats = self.chk_sats.isChecked()
         self.renderer.show_alt = self.chk_alt.isChecked()
         
+        # 🔥 更新遥测开关
+        self.renderer.show_gball = self.chk_show_gball.isChecked()
+        self.renderer.show_attitude = self.chk_show_attitude.isChecked()
+
         self.canvas.preview_show_intro = self.chk_show_intro.isChecked()
         self.canvas.preview_intro_style = self.combo_intro_style.currentData()
         self.canvas.preview_logo_size = self.logo_size_state['val']
-        
         intro_dur = self.intro_renderer.duration if self.canvas.preview_show_intro else 0
         total_time = self.data_manager.total_duration + intro_dur
         if total_time > 0: self.slider.setRange(0, int(total_time * 10))
@@ -410,11 +490,15 @@ class MainWindow(QMainWindow):
         old_style = self.renderer.map_style
         old_gauge = self.renderer.show_gauge
         old_extra = self.renderer.show_extra
+        # 临时关闭遥测和仪表
+        old_gball = self.renderer.show_gball
+        old_att = self.renderer.show_attitude
         self.renderer.map_style = MAP_STATIC_NORTH
         self.renderer.show_gauge = False
         self.renderer.show_extra = False
+        self.renderer.show_gball = False
+        self.renderer.show_attitude = False
         w, h = RESOLUTION
-        # 🔥 修复：分开写，符合 Python 语法
         if w % 2 != 0: w -= 1
         if h % 2 != 0: h -= 1
         image = QImage(w, h, QImage.Format.Format_ARGB32_Premultiplied)
@@ -428,6 +512,8 @@ class MainWindow(QMainWindow):
         self.renderer.map_style = old_style
         self.renderer.show_gauge = old_gauge
         self.renderer.show_extra = old_extra
+        self.renderer.show_gball = old_gball
+        self.renderer.show_attitude = old_att
         self.chk_show_gauge.setChecked(old_gauge)
         self.chk_show_extra.setChecked(old_extra)
         QMessageBox.information(self, "成功", f"封面图已保存")
