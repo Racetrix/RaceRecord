@@ -1,47 +1,76 @@
-name: Build Windows Exe
+name: Build and Release Windows Exe
 
-# 触发机制：当 push 代码到 main 分支，或者手动点击运行 workflow 时触发
+# 触发条件：
+# 1. 当推送 v 开头的标签时（例如 v1.0, v0.0.1）触发自动发布
+# 2. 也可以在 Actions 页面手动点击 "Run workflow" 触发
 on:
   push:
-    branches: [ "main" ]
+    tags:
+      - 'v*'
   workflow_dispatch:
+
+# 必须赋予写权限，否则无法上传文件到 Release 页面
+permissions:
+  contents: write
 
 jobs:
   build:
-    runs-on: windows-latest  # 使用 GitHub 提供的 Windows 环境
+    runs-on: windows-latest
 
     steps:
     # 1. 拉取代码
     - name: Checkout code
       uses: actions/checkout@v4
 
-    # 2. 设置 Python 环境
+    # 2. 配置 Python 环境
     - name: Set up Python
       uses: actions/setup-python@v5
       with:
-        python-version: '3.10' # 建议根据你本地开发环境修改版本
-        cache: 'pip' # 开启缓存，加快依赖安装速度
+        python-version: '3.10' # 根据你的开发环境调整，建议 3.10 或 3.11
+        cache: 'pip'
 
-    # 3. 安装依赖 (PyInstaller 和你项目所需的库)
+    # 3. 安装依赖
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
         pip install pyinstaller
-        # 如果你有 requirements.txt，会自动安装；没有则跳过
+        # 如果项目里有 requirements.txt 则自动安装
         if (Test-Path requirements.txt) { pip install -r requirements.txt }
 
-    # 4. 执行打包 (核心步骤)
-    - name: Build with PyInstaller
-      # ⚠️ 注意：请把下面的 main.py 换成你项目的入口文件名
-      # --onefile: 打包成单文件
-      # --noconsole: 运行时不显示黑框 (如果是GUI程序请加上这个参数)
-      # --name: 生成 exe 的名字
+    # 4. 编译【正式版】 (无黑框，适合普通用户)
+    - name: Build Release Version (No Console)
+      # --noconsole: 隐藏黑框
+      # --copy-metadata imageio: 解决 imageio 报错的关键参数
       run: |
-        pyinstaller --onefile --clean  --copy-metadata imageio --name "RacetrixApp" race_app.py
+        pyinstaller --onefile --clean --noconsole --copy-metadata imageio --name "Racetrix" race_app.py
 
-    # 5. 上传生成的 exe 到 GitHub Actions 的 Artifacts
-    - name: Upload Artifact
+    # 5. 编译【调试版】 (有黑框，适合你 Debug)
+    - name: Build Debug Version (With Console)
+      # --console: 显示黑框
+      # 文件名加 _Debug 后缀区分
+      run: |
+        pyinstaller --onefile --clean --console --copy-metadata imageio --name "Racetrix_Debug" race_app.py
+
+    # 6. 上传正式版到 Action 页面 (方便单独下载)
+    - name: Upload Release Artifact
       uses: actions/upload-artifact@v4
       with:
-        name: Windows-Executable
-        path: dist/*.exe
+        name: Racetrix-Release-Version
+        path: dist/Racetrix.exe
+
+    # 7. 上传调试版到 Action 页面 (方便单独下载)
+    - name: Upload Debug Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: Racetrix-Debug-Version
+        path: dist/Racetrix_Debug.exe
+
+    # 8. 发布到 GitHub Release 页面 (仅当打 Tag 时触发)
+    - name: Create Release
+      uses: softprops/action-gh-release@v1
+      if: startsWith(github.ref, 'refs/tags/')
+      with:
+        # 同时上传两个版本到 Release 附件中
+        files: |
+          dist/Racetrix.exe
+          dist/Racetrix_Debug.exe
