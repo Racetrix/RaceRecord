@@ -1,7 +1,14 @@
 import sys, os
-import imageio
+if getattr(sys, 'frozen', False):
+    with patch('importlib.metadata.version') as mock_version:
+        mock_version.return_value = '2.37.2'  # 你的imageio版本
+        import imageio
+else:
+    import imageio
+
 import cv2
 import numpy as np
+from unittest.mock import patch
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,

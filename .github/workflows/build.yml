@@ -37,7 +37,7 @@ jobs:
       # --noconsole: 运行时不显示黑框 (如果是GUI程序请加上这个参数)
       # --name: 生成 exe 的名字
       run: |
-        pyinstaller --onefile --clean --name "RacetrixApp" race_app.py
+        pyinstaller --onefile --clean --name --copy-metadata imageio "RacetrixApp" race_app.py
 
     # 5. 上传生成的 exe 到 GitHub Actions 的 Artifacts
     - name: Upload Artifact
