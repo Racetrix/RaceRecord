@@ -1,0 +1,47 @@
+name: Build Windows Exe
+
+# 触发机制：当 push 代码到 main 分支，或者手动点击运行 workflow 时触发
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest  # 使用 GitHub 提供的 Windows 环境
+
+    steps:
+    # 1. 拉取代码
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    # 2. 设置 Python 环境
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.10' # 建议根据你本地开发环境修改版本
+        cache: 'pip' # 开启缓存，加快依赖安装速度
+
+    # 3. 安装依赖 (PyInstaller 和你项目所需的库)
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install pyinstaller
+        # 如果你有 requirements.txt，会自动安装；没有则跳过
+        if (Test-Path requirements.txt) { pip install -r requirements.txt }
+
+    # 4. 执行打包 (核心步骤)
+    - name: Build with PyInstaller
+      # ⚠️ 注意：请把下面的 main.py 换成你项目的入口文件名
+      # --onefile: 打包成单文件
+      # --noconsole: 运行时不显示黑框 (如果是GUI程序请加上这个参数)
+      # --name: 生成 exe 的名字
+      run: |
+        pyinstaller --onefile --clean --name "RacetrixApp" main.py
+
+    # 5. 上传生成的 exe 到 GitHub Actions 的 Artifacts
+    - name: Upload Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: Windows-Executable
+        path: dist/*.exe
