@@ -42,7 +42,90 @@ QCheckBox { spacing: 5px; }
 QSlider::groove:horizontal { border: 1px solid #333; height: 6px; background: #222; margin: 2px 0; }
 QSlider::handle:horizontal { background: #4EC9B0; border: 1px solid #4EC9B0; width: 12px; height: 12px; margin: -4px 0; border-radius: 6px; }
 """
+class VideoPlayerThread(QThread):
+    frame_ready = pyqtSignal(QImage)
+    
+    def __init__(self, path):
+        super().__init__()
+        self.path = path
+        self.running = True
+        self.target_time = 0.0
+        
+    def run(self):
+        # 尝试使用 MSMF (Windows 硬件加速后端)
+        cap = cv2.VideoCapture(self.path, cv2.CAP_MSMF)
+        if not cap.isOpened():
+            cap = cv2.VideoCapture(self.path)
+            
+        current_pos = 0.0
+        
+        while self.running:
+            # 计算时间差：目标时间 - 当前视频位置
+            diff = self.target_time - current_pos
+            
+            # 情况A: 偏差太大 (>1秒) -> 直接跳转 (Seek)
+            if abs(diff) > 1.0:
+                cap.set(cv2.CAP_PROP_POS_MSEC, self.target_time * 1000)
+                current_pos = self.target_time
+                ret, frame = cap.read()
+                if ret: self.process_and_emit(frame)
+                
+            # 情况B: 稍微落后 (0 ~ 1秒) -> 连续读取 (追赶)
+            elif diff > 0.01: 
+                ret, frame = cap.read()
+                if ret:
+                    self.process_and_emit(frame)
+                    # 尝试更新当前位置
+                    pos_msec = cap.get(cv2.CAP_PROP_POS_MSEC)
+                    if pos_msec > 0:
+                        current_pos = pos_msec / 1000.0
+                else:
+                    # 读不到帧(结尾)，短暂休息
+                    self.msleep(50)
+                    
+            # 情况C: 视频跑得太快 (diff <= 0) -> 等待主界面时间追上来
+            else:
+                self.msleep(10) 
 
+        cap.release()
+
+    def process_and_emit(self, frame):
+        try:
+            h, w = frame.shape[:2]
+            # 强制 540P 预览，保证流畅
+            preview_h = 540
+            if h > preview_h:
+                scale = preview_h / h
+                new_w = int(w * scale)
+                # 使用最快的缩放算法 INTER_NEAREST
+                frame = cv2.resize(frame, (new_w, preview_h), interpolation=cv2.INTER_NEAREST)
+            
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            h, w, ch = frame.shape
+            qimg = QImage(frame.data, w, h, ch * w, QImage.Format.Format_RGB888).copy()
+            self.frame_ready.emit(qimg)
+        except Exception:
+            pass
+
+    # === 🔥 兼容性修复区域 🔥 ===
+    
+    # 1. 加回 seek 方法 (sync_to 的别名)
+    def seek(self, t):
+        self.target_time = t
+
+    def sync_to(self, t):
+        self.target_time = t
+
+    # 2. 加回 set_playing 方法 (空函数)
+    # 新版逻辑是根据时间自动追赶，不需要显式的 playing 状态，
+    # 但为了防止旧版主程序报错，这里留一个空壳。
+    def set_playing(self, playing):
+        pass
+
+    def stop(self):
+        self.running = False
+        self.wait()
+    
 class RecorderWorker(QThread):
     progress = pyqtSignal(int); finished = pyqtSignal(str)
     
@@ -194,6 +277,9 @@ class MainWindow(QMainWindow):
         self.video_duration = 0
         self.current_video_pos = -1.0
         
+        # 🔥 新增：默认帧率变量
+        self.video_fps = 30.0 
+        
         main = QWidget(); self.setCentralWidget(main)
         layout = QHBoxLayout(main)
         
@@ -246,8 +332,6 @@ class MainWindow(QMainWindow):
         self.add_combo(lm, "模式", ["静态北向", "动态车头"], self.set_map_mode)
         self.add_combo(lm, "颜色", ["速度渐变", "纯白"], self.set_map_color)
         self.add_step(lm, "缩放", 0.1, 5.0, 1.0, 0.1, lambda v: setattr(self.renderer, 'map_zoom_factor', v))
-        
-        # 🔥🔥🔥 新增：赛道宽度和车标大小调节 🔥🔥🔥
         self.add_step(lm, "赛道宽度", 1, 100, 15, 1, lambda v: setattr(self.renderer, 'track_width', int(v)))
         self.add_step(lm, "车标大小", 5, 200, 30, 2, lambda v: setattr(self.renderer, 'car_size', int(v)))
         
@@ -309,13 +393,12 @@ class MainWindow(QMainWindow):
         self.tabs.setCurrentIndex(0); self.canvas.mode = MODE_STUDIO
 
     def match_video_res(self):
-        if self.cap is None or not self.cap.isOpened():
+        if not hasattr(self, 'video_w') or self.video_w == 0:
             QMessageBox.warning(self, "提示", "请先加载视频文件")
             return
-        w = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        h = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        self.sb_w.setValue(w); self.sb_h.setValue(h)
-        QMessageBox.information(self, "成功", f"分辨率已设置为: {w} x {h}")
+        self.sb_w.setValue(self.video_w)
+        self.sb_h.setValue(self.video_h)
+        QMessageBox.information(self, "成功", f"分辨率已设置为: {self.video_w} x {self.video_h}")
 
     def create_slider(self, name, min_v, max_v, init_v, callback):
         l = QVBoxLayout(); h = QHBoxLayout()
@@ -354,33 +437,60 @@ class MainWindow(QMainWindow):
             self.sb_start.setMaximum(d); self.sb_end.setMaximum(d); self.sb_end.setValue(d)
             self.start_time = 0.0; self.end_time = d; self.canvas.update()
 
+    # === 放在 MainWindow 类中 (请只覆盖修改的函数) ===
+
     def load_video(self):
         p, _ = QFileDialog.getOpenFileName(self, "Video", "", "Video (*.mp4 *.mov *.avi)")
         if p:
-            self.cap_path = p; self.cap = cv2.VideoCapture(p)
-            if not self.cap.isOpened(): return
-            fps = self.cap.get(cv2.CAP_PROP_FPS)
-            frames = self.cap.get(cv2.CAP_PROP_FRAME_COUNT)
-            dur = frames / fps if fps > 0 else 0
-            self.lbl_video.setText(f"{dur:.1f}s"); self.video_duration = dur
-            self.current_video_pos = -1 
-            self.update_video_frame(force_seek=True); self.canvas.update()
+            self.cap_path = p
+            
+            # 1. 获取视频信息 & 🔥 立即读取第一帧
+            temp_cap = cv2.VideoCapture(p)
+            if temp_cap.isOpened():
+                # 读取信息
+                fps = temp_cap.get(cv2.CAP_PROP_FPS)
+                self.video_fps = fps if fps > 0 else 30.0 
+                frames = temp_cap.get(cv2.CAP_PROP_FRAME_COUNT)
+                self.video_duration = frames / fps if fps > 0 else 0
+                self.video_w = int(temp_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                self.video_h = int(temp_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                self.lbl_video.setText(f"{self.video_duration:.1f}s ({self.video_fps:.2f} fps)")
+
+                # 🔥 关键修改：立即读取第一帧用于显示，解决“不知道导入对不对”的问题
+                ret, frame = temp_cap.read()
+                if ret:
+                    # 同样进行缩放处理，防止第一帧就是 4K 导致渲染卡顿
+                    h, w = frame.shape[:2]
+                    preview_h = 540
+                    if h > preview_h:
+                        scale = preview_h / h
+                        new_w = int(w * scale)
+                        frame = cv2.resize(frame, (new_w, preview_h), interpolation=cv2.INTER_NEAREST)
+                    
+                    frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    h, w, ch = frame.shape
+                    # 立即更新画布
+                    qimg = QImage(frame.data, w, h, ch * w, QImage.Format.Format_RGB888).copy()
+                    self.on_video_frame(qimg)
+
+                temp_cap.release()
+            
+            # 2. 启动后台线程
+            if hasattr(self, 'video_thread'): self.video_thread.stop()
+            self.video_thread = VideoPlayerThread(p)
+            self.video_thread.frame_ready.connect(self.on_video_frame)
+            self.video_thread.start()
+            self.video_thread.sync_to(0)
+            
             if QMessageBox.question(self, "设置", "检测到视频，是否自动将画布分辨率设为视频大小？", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No) == QMessageBox.StandardButton.Yes:
                 self.match_video_res()
 
-    def update_video_frame(self, force_seek=False):
-        if self.cap is None or not self.cap.isOpened(): return
-        t = self.canvas.t
-        if t > self.video_duration: return
-        time_diff = t - self.current_video_pos
-        if force_seek or time_diff < 0 or time_diff > 0.1:
-            self.cap.set(cv2.CAP_PROP_POS_MSEC, t * 1000)
-        ret, frame = self.cap.read()
-        if ret:
-            self.current_video_pos = self.cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
-            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            h, w, ch = frame.shape
-            self.canvas.bg_frame = QImage(frame.data, w, h, ch*w, QImage.Format.Format_RGB888).copy()
+    # 其他函数保持不变，为确保上下文完整，如果你覆盖时遇到缩进问题，
+    # 只需要确保上面的 load_video 替换了原有的即可。
+
+    def on_video_frame(self, qimg):
+        self.canvas.bg_frame = qimg
+        self.canvas.update()
 
     def update_g_smooth(self, val): self.g_smooth_val = val; self.reprocess_data()
     def reprocess_data(self): self.dm.process(10, 5, use_gaussian=self.chk_1hz.isChecked(), g_smooth_factor=self.g_smooth_val); self.canvas.update()
@@ -389,7 +499,9 @@ class MainWindow(QMainWindow):
         s = self.sb_start.value(); e = self.sb_end.value()
         if s >= e: e = s + 1; self.sb_end.setValue(e)
         self.start_time = s; self.end_time = e
-        self.slider.setRange(int(s*100), int(e*100)); self.canvas.t = s; self.update_video_frame(force_seek=True); self.canvas.update()
+        self.slider.setRange(int(s*100), int(e*100)); self.canvas.t = s; 
+        if hasattr(self, 'video_thread'): self.video_thread.sync_to(s)
+        self.canvas.update()
 
     def on_tab_change(self, idx): 
         mode_map = {0: MODE_STUDIO, 1: MODE_MAP, 2: MODE_SPEED, 3: MODE_GFORCE, 4: MODE_ATTITUDE}
@@ -411,29 +523,49 @@ class MainWindow(QMainWindow):
         img.save(p); QMessageBox.information(self, "成功", f"地图封面已保存至:\n{p}")
 
     def toggle_play(self):
-        if self.timer.isActive(): self.timer.stop(); self.btn_play.setText("▶ 播放")
-        else: self.timer.start(33); self.btn_play.setText("⏸ 暂停")
+        if self.timer.isActive():
+            self.timer.stop()
+            self.btn_play.setText("▶ 播放")
+        else:
+            # 🔥 修复：根据视频实际 FPS 设定定时器间隔
+            # 例如 60fps -> 16ms, 30fps -> 33ms
+            interval = int(1000.0 / self.video_fps)
+            self.timer.start(interval)
+            self.btn_play.setText("⏸ 暂停")
     
     def update_play(self):
-        dt = 0.033; self.canvas.t += dt
-        if self.canvas.t > self.end_time: self.canvas.t = self.start_time; self.update_video_frame(force_seek=True)
-        else: self.update_video_frame(force_seek=False)
-        self.slider.setValue(int(self.canvas.t*100)); self.canvas.update()
+        # 🔥 修复：时间增量也必须完全匹配视频 FPS
+        dt = 1.0 / self.video_fps
+        self.canvas.t += dt
+        
+        if self.canvas.t > self.end_time: self.canvas.t = self.start_time
+        
+        if hasattr(self, 'video_thread'):
+            self.video_thread.sync_to(self.canvas.t)
+            
+        self.slider.blockSignals(True)
+        self.slider.setValue(int(self.canvas.t*100))
+        self.slider.blockSignals(False)
+        self.canvas.update()
 
-    def seek(self, v): self.canvas.t = v/100.0; self.update_video_frame(force_seek=True); self.canvas.update()
+    def seek(self, v): 
+        t = v/100.0
+        self.canvas.t = t
+        if hasattr(self, 'video_thread'): self.video_thread.sync_to(t)
+        self.canvas.update()
     
     def export(self):
         default_ext = ".mov" if self.rb_mov.isChecked() else ".mp4"
         p, _ = QFileDialog.getSaveFileName(self, "Export Video", "race_overlay" + default_ext, f"Video (*{default_ext})")
         if not p: return
         self.btn_exp.setEnabled(False); self.btn_exp.setText("正在渲染...")
-        # 传入 supersample 参数
+        
         self.worker = RecorderWorker(
             self.renderer, p, self.rb_mov.isChecked(), self.canvas.mode, 
             60, self.sb_w.value(), self.sb_h.value(), 
             self.start_time, self.end_time, 
             self.cap_path, 
-            self.chk_supersample.isChecked() # 🔥 传入开关状态
+            self.chk_supersample.isChecked()
         ) 
         self.worker.progress.connect(self.pbar.setValue)
         def on_finish(msg): self.btn_exp.setEnabled(True); self.btn_exp.setText("⏺ 渲染导出视频"); self.pbar.setValue(0); QMessageBox.information(self, "渲染结束", msg)

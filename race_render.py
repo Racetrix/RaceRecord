@@ -15,6 +15,7 @@ MAP_STATIC = 0
 MAP_DYNAMIC = 1
 STYLE_DIGITAL = 0
 STYLE_NEEDLE = 1
+STYLE_LINEAR = 2
 COLOR_SPEED = 0
 COLOR_WHITE = 1
 
@@ -115,7 +116,8 @@ class Renderer:
                 self.render_map(painter, w, h, state, current_time, transparent_bg)
             elif target_mode == MODE_SPEED:
                 self.render_single_gauge(painter, cx, cy, min_dim, self.gauge_scale, lambda: 
-                    self.draw_digital_gauge(painter, state['speed']) if self.gauge_style == STYLE_DIGITAL else self.draw_custom_needle_gauge(painter, state['speed']))
+                    self.draw_digital_gauge(painter, state['speed']) if self.gauge_style == STYLE_DIGITAL 
+                    else self.draw_custom_needle_gauge(painter, state['speed']))
             elif target_mode == MODE_GFORCE:
                 self.render_single_gauge(painter, cx, cy, min_dim, self.g_scale, lambda: self.draw_custom_gforce(painter, state))
             elif target_mode == MODE_ATTITUDE:
@@ -141,7 +143,8 @@ class Renderer:
             
         elif key == 'speed':
             if self.gauge_style == STYLE_DIGITAL: self.draw_digital_gauge(painter, state['speed'])
-            else: self.draw_custom_needle_gauge(painter, state['speed'])
+            elif self.gauge_style == STYLE_NEEDLE: self.draw_custom_needle_gauge(painter, state['speed'])
+            # elif self.gauge_style == STYLE_LINEAR: self.draw_linear_gauge(painter, state['speed'])
         elif key == 'gforce':
             self.draw_custom_gforce(painter, state)
         elif key == 'attitude':
@@ -299,10 +302,9 @@ class Renderer:
         max_val = max(80, int(self.max_speed))
         dynamic_color = get_speed_color(speed, self.grad_min, self.grad_max)
         
-        painter.setBrush(QColor(0, 0, 0, 0)); painter.setPen(QPen(QColor(255, 255, 255, 30), 4)) 
-        painter.drawEllipse(QPointF(0,0), radius, radius)
-
-        # 🔥 修复3：改进刻度步长计算，防止低速时刻度太密
+        # 1. 背景：透明
+        
+        # 2. 刻度步长
         if max_val <= 60: step_val = 5
         elif max_val <= 160: step_val = 10
         elif max_val <= 300: step_val = 20
@@ -324,8 +326,10 @@ class Renderer:
             cos_a = math.cos(angle_rad); sin_a = -math.sin(angle_rad)
             is_major = (i % sub_divisions == 0)
             
-            if is_major: r_out = radius; r_in = radius - 35; width = 6; color = Qt.GlobalColor.white
-            else: r_out = radius - 2; r_in = radius - 18; width = 3; color = QColor(200, 200, 200) 
+            if is_major: 
+                r_out = radius; r_in = radius - 35; width = 6; color = Qt.GlobalColor.white
+            else: 
+                r_out = radius - 2; r_in = radius - 18; width = 3; color = QColor(200, 200, 200) 
             
             p_out = QPointF(r_out * cos_a, r_out * sin_a); p_in = QPointF(r_in * cos_a, r_in * sin_a)
             painter.setPen(QPen(color, width, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap)); painter.drawLine(p_in, p_out)
@@ -337,11 +341,25 @@ class Renderer:
                 painter.drawText(text_rect, Qt.AlignmentFlag.AlignCenter, str(int(val)))
         painter.restore()
         
-        redline_angle_start = (225 - (0.85 * 270))
+        # 3. 红区 (修复报错：使用 Qt.PenCapStyle.FlatCap)
+        # 逻辑：寻找大约在 82% 处的那个大刻度作为起点
+        raw_start_val = max_val * 0.82 
+        # 吸附算法：向下取整到最近的 step_val
+        red_start_val = int(raw_start_val / step_val) * step_val
+        
+        if red_start_val >= max_val: red_start_val = max_val - step_val
+        
+        red_start_ratio = red_start_val / max_val
+        red_angle_start = 225 - (red_start_ratio * 270)
+        red_angle_span = -((1.0 - red_start_ratio) * 270)
+        
+        # 🔥 修改这里：Qt.PenCapStyle.ButtCap -> Qt.PenCapStyle.FlatCap
+        # FlatCap 就是平头端点，效果和 ButtCap 一样，能保证切口整齐
         painter.setPen(QPen(QColor(220, 0, 0, 200), 16, Qt.PenStyle.SolidLine, Qt.PenCapStyle.FlatCap))
         r_red = radius - 15 
-        painter.drawArc(QRectF(-r_red, -r_red, r_red*2, r_red*2), int(redline_angle_start * 16), int(-(270 * 0.15) * 16))
+        painter.drawArc(QRectF(-r_red, -r_red, r_red*2, r_red*2), int(red_angle_start * 16), int(red_angle_span * 16))
 
+        # 4. 指针
         current_ratio = min(speed / max_val, 1.05)
         painter.save(); painter.rotate(-(225 - (current_ratio * 270)))
         needle_len = radius - 25; root_w = 11; tail_len = 25 
@@ -349,17 +367,20 @@ class Renderer:
         glow_color = QColor(dynamic_color); glow_color.setAlpha(40)
         painter.setBrush(QBrush(glow_color)); painter.setPen(Qt.PenStyle.NoPen)
         painter.drawPolygon(QPolygonF([QPointF(0, -(root_w+8)), QPointF(needle_len+5, 0), QPointF(0, (root_w+8)), QPointF(-(tail_len+5), 0)]))
+        
         glow_color.setAlpha(100); painter.setBrush(QBrush(glow_color))
         painter.drawPolygon(QPolygonF([QPointF(0, -(root_w+3)), QPointF(needle_len+2, 0), QPointF(0, (root_w+3)), QPointF(-(tail_len+2), 0)]))
         painter.setBrush(QBrush(dynamic_color))
         painter.drawPolygon(QPolygonF([QPointF(0, -root_w), QPointF(needle_len, 0), QPointF(0, root_w), QPointF(-tail_len, 0)]))
         painter.restore()
         
+        # 5. 中心盖帽
         painter.setBrush(Qt.BrushStyle.NoBrush); painter.setPen(QPen(Qt.GlobalColor.white, 4)) 
         painter.drawEllipse(QPointF(0,0), 22, 22) 
         painter.setBrush(QColor(10, 10, 10)); painter.setPen(Qt.PenStyle.NoPen)
         painter.drawEllipse(QPointF(0,0), 18, 18)
         
+        # 6. 底部数字
         painter.setFont(QFont("Arial", 80, QFont.Weight.Black)); painter.setPen(Qt.GlobalColor.white)
         painter.drawText(QRectF(-150, 75, 300, 90), Qt.AlignmentFlag.AlignCenter, f"{int(speed)}")
         painter.setFont(self.font_mid); painter.setPen(QColor(200, 200, 200))

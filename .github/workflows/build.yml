@@ -1,15 +1,11 @@
 name: Build and Release Windows Exe
 
-# 触发条件：
-# 1. 当推送 v 开头的标签时（例如 v1.0, v0.0.1）触发自动发布
-# 2. 也可以在 Actions 页面手动点击 "Run workflow" 触发
 on:
   push:
-    tags:
-      - 'v*'
-  workflow_dispatch:
+    branches: [ "main" ] # 新增：代码推送到 main 分支时也会触发编译
+    tags: [ "v*" ]       # 保持：打 v 开头的 tag 时触发
+  workflow_dispatch:     # 保持：允许手动点击按钮触发
 
-# 必须赋予写权限，否则无法上传文件到 Release 页面
 permissions:
   contents: write
 
@@ -18,59 +14,52 @@ jobs:
     runs-on: windows-latest
 
     steps:
-    # 1. 拉取代码
     - name: Checkout code
       uses: actions/checkout@v4
 
-    # 2. 配置 Python 环境
     - name: Set up Python
       uses: actions/setup-python@v5
       with:
-        python-version: '3.10' # 根据你的开发环境调整，建议 3.10 或 3.11
+        python-version: '3.10'
         cache: 'pip'
 
-    # 3. 安装依赖
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
         pip install pyinstaller
-        # 如果项目里有 requirements.txt 则自动安装
         if (Test-Path requirements.txt) { pip install -r requirements.txt }
 
-    # 4. 编译【正式版】 (无黑框，适合普通用户)
+    # --- 编译步骤 (每次 Push 都会跑) ---
+    
     - name: Build Release Version (No Console)
-      # --noconsole: 隐藏黑框
-      # --copy-metadata imageio: 解决 imageio 报错的关键参数
       run: |
         pyinstaller --onefile --clean --noconsole --copy-metadata imageio --name "Racetrix" race_app.py
 
-    # 5. 编译【调试版】 (有黑框，适合你 Debug)
     - name: Build Debug Version (With Console)
-      # --console: 显示黑框
-      # 文件名加 _Debug 后缀区分
       run: |
         pyinstaller --onefile --clean --console --copy-metadata imageio --name "Racetrix_Debug" race_app.py
 
-    # 6. 上传正式版到 Action 页面 (方便单独下载)
+    # --- 上传到 Action Artifacts (每次 Push 都会跑) ---
+    # 这样你平时 Push 代码后，可以在 Actions 页面底部下载来测试，但不会发版
+    
     - name: Upload Release Artifact
       uses: actions/upload-artifact@v4
       with:
         name: Racetrix-Release-Version
         path: dist/Racetrix.exe
 
-    # 7. 上传调试版到 Action 页面 (方便单独下载)
     - name: Upload Debug Artifact
       uses: actions/upload-artifact@v4
       with:
         name: Racetrix-Debug-Version
         path: dist/Racetrix_Debug.exe
 
-    # 8. 发布到 GitHub Release 页面 (仅当打 Tag 时触发)
+    # --- 发布到 Release 页面 (仅当打 Tag 时才跑) ---
+    
     - name: Create Release
       uses: softprops/action-gh-release@v1
-      if: startsWith(github.ref, 'refs/tags/')
+      if: startsWith(github.ref, 'refs/tags/')  # 关键判断：只有 Tag 触发时才执行这一步
       with:
-        # 同时上传两个版本到 Release 附件中
         files: |
           dist/Racetrix.exe
           dist/Racetrix_Debug.exe
